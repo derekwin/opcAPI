@@ -1,0 +1,17 @@
+{
+  "events": [
+    {
+      "id": "aud_e4f252a325944473",
+      "resource": "user",
+      "action": "create",
+      "actor_user_id": "usr_be2e025e649dfeda",
+      "actor_tenant_id": "ten_32c69b691517341e",
+      "target_id": "usr_6100d82329e5a558",
+      "target_tenant_id": "ten_32c69b691517341e",
+      "metadata": {
+        "role": "admin"
+      },
+      "created_at": "2026-03-01T15:13:22.030624Z"
+    }
+  ]
+}
