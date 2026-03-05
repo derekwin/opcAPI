@@ -15,14 +15,13 @@ type Config struct {
 	ShutdownTimeout time.Duration
 	LogLevel        string
 
-	RequireAPIKey         bool
-	RequireTenantBoundKey bool
-	APIKeys               string
-	RequestRPMLimit       int
-	DailyTokenLimit       int
-	PolicyStorePath       string
-	PolicyRefresh         time.Duration
-	PolicyBackend         string
+	RequireAPIKey   bool
+	APIKeys         string
+	RequestRPMLimit int
+	DailyTokenLimit int
+	PolicyStorePath string
+	PolicyRefresh   time.Duration
+	PolicyBackend   string
 
 	RedisAddr         string
 	RedisPassword     string
@@ -37,15 +36,19 @@ type Config struct {
 	BillingStorePath   string
 	PromptAPIStorePath string
 	AuditStorePath     string
+	UpstreamStorePath  string
 	SessionSecret      string
 	SessionTTL         time.Duration
-	PhoneTestCode      string
 
-	ProviderTimeout time.Duration
-	DefaultProvider string
-	OpenAIBaseURL   string
-	OpenAIAPIKey    string
-	OllamaBaseURL   string
+	ProviderTimeout  time.Duration
+	DefaultProvider  string
+	OpenAIBaseURL    string
+	OpenAIAPIKey     string
+	AnthropicBaseURL string
+	AnthropicAPIKey  string
+	GeminiBaseURL    string
+	GeminiAPIKey     string
+	OllamaBaseURL    string
 }
 
 // Load reads configuration from environment variables with safe defaults.
@@ -58,14 +61,13 @@ func Load() Config {
 		ShutdownTimeout: getEnvDuration("HTTP_SHUTDOWN_TIMEOUT", 10*time.Second),
 		LogLevel:        getEnv("LOG_LEVEL", "info"),
 
-		RequireAPIKey:         getEnvBool("REQUIRE_API_KEY", true),
-		RequireTenantBoundKey: getEnvBool("REQUIRE_TENANT_BOUND_KEY", true),
-		APIKeys:               getEnv("API_KEYS", "sk-opcapi-dev"),
-		RequestRPMLimit:       getEnvInt("REQUEST_RPM_LIMIT", 120),
-		DailyTokenLimit:       getEnvInt("DAILY_TOKEN_LIMIT", 1000000),
-		PolicyStorePath:       getEnv("POLICY_STORE_PATH", "data/policies.json"),
-		PolicyRefresh:         getEnvDuration("POLICY_REFRESH_INTERVAL", 30*time.Second),
-		PolicyBackend:         getEnv("POLICY_BACKEND", "file"),
+		RequireAPIKey:   getEnvBool("REQUIRE_API_KEY", true),
+		APIKeys:         getEnv("API_KEYS", "sk-opcapi-dev"),
+		RequestRPMLimit: getEnvInt("REQUEST_RPM_LIMIT", 120),
+		DailyTokenLimit: getEnvInt("DAILY_TOKEN_LIMIT", 1000000),
+		PolicyStorePath: getEnv("POLICY_STORE_PATH", "data/policies.json"),
+		PolicyRefresh:   getEnvDuration("POLICY_REFRESH_INTERVAL", 30*time.Second),
+		PolicyBackend:   getEnv("POLICY_BACKEND", "file"),
 
 		RedisAddr:         getEnv("REDIS_ADDR", "127.0.0.1:6379"),
 		RedisPassword:     getEnv("REDIS_PASSWORD", ""),
@@ -80,15 +82,19 @@ func Load() Config {
 		BillingStorePath:   getEnv("BILLING_STORE_PATH", "data/billing.json"),
 		PromptAPIStorePath: getEnv("PROMPT_API_STORE_PATH", "data/prompt_apis.json"),
 		AuditStorePath:     getEnv("AUDIT_STORE_PATH", "data/audit_logs.json"),
+		UpstreamStorePath:  getEnv("UPSTREAM_STORE_PATH", "data/upstreams.json"),
 		SessionSecret:      getEnv("SESSION_SECRET", "opcapi-dev-session-secret"),
 		SessionTTL:         getEnvDuration("SESSION_TTL", 168*time.Hour),
-		PhoneTestCode:      getEnv("PHONE_TEST_CODE", "000000"),
 
-		ProviderTimeout: getEnvDuration("PROVIDER_TIMEOUT", 60*time.Second),
-		DefaultProvider: getEnv("DEFAULT_PROVIDER", "stub"),
-		OpenAIBaseURL:   getEnv("OPENAI_BASE_URL", "https://api.openai.com"),
-		OpenAIAPIKey:    getEnv("OPENAI_API_KEY", ""),
-		OllamaBaseURL:   getEnv("OLLAMA_BASE_URL", "http://localhost:11434"),
+		ProviderTimeout:  getEnvDuration("PROVIDER_TIMEOUT", 60*time.Second),
+		DefaultProvider:  getEnv("DEFAULT_PROVIDER", "stub"),
+		OpenAIBaseURL:    getEnv("OPENAI_BASE_URL", "https://api.openai.com"),
+		OpenAIAPIKey:     getEnv("OPENAI_API_KEY", ""),
+		AnthropicBaseURL: getEnv("ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
+		AnthropicAPIKey:  getEnv("ANTHROPIC_API_KEY", ""),
+		GeminiBaseURL:    getEnv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com"),
+		GeminiAPIKey:     getEnv("GEMINI_API_KEY", ""),
+		OllamaBaseURL:    getEnv("OLLAMA_BASE_URL", "http://localhost:11434"),
 	}
 }
 

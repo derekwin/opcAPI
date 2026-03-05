@@ -2,10 +2,12 @@ package user
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -25,13 +27,14 @@ func NewSessionManager(secret string, ttl time.Duration) *SessionManager {
 	return &SessionManager{secret: []byte(secret), ttl: ttl}
 }
 
-func (s *SessionManager) Issue(userID, tenantID, role string) (string, SessionClaims, error) {
+func (s *SessionManager) Issue(userID, role string) (string, SessionClaims, error) {
 	now := time.Now().UTC()
 	claims := SessionClaims{
-		UserID:   userID,
-		TenantID: tenantID,
-		Role:     role,
-		Exp:      now.Add(s.ttl).Unix(),
+		UserID: userID,
+		Role:   role,
+		JTI:    newJTI(),
+		Iat:    now.Unix(),
+		Exp:    now.Add(s.ttl).Unix(),
 	}
 	payload, err := json.Marshal(claims)
 	if err != nil {
@@ -65,7 +68,7 @@ func (s *SessionManager) Parse(token string) (SessionClaims, error) {
 	if err := json.Unmarshal(payload, &claims); err != nil {
 		return SessionClaims{}, ErrSessionTokenInvalid
 	}
-	if claims.UserID == "" || claims.TenantID == "" || claims.Role == "" {
+	if claims.UserID == "" || claims.Role == "" || claims.JTI == "" {
 		return SessionClaims{}, ErrSessionTokenInvalid
 	}
 
@@ -79,4 +82,12 @@ func (s *SessionManager) sign(body string) string {
 	h := hmac.New(sha256.New, s.secret)
 	_, _ = h.Write([]byte(body))
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+func newJTI() string {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("jti-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(buf)
 }

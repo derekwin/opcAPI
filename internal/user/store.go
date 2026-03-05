@@ -3,18 +3,40 @@ package user
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 )
 
+type userRecord struct {
+	ID           string    `json:"id"`
+	Email        string    `json:"email"`
+	PasswordHash string    `json:"password_hash"`
+	PasswordSalt string    `json:"password_salt"`
+	Role         string    `json:"role"`
+	Status       string    `json:"status"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+type revokedSession struct {
+	JTI       string    `json:"jti"`
+	Exp       int64     `json:"exp"`
+	RevokedAt time.Time `json:"revoked_at"`
+}
+
+type credential struct {
+	User         User
+	PasswordHash string
+	PasswordSalt string
+}
+
 type fileDataset struct {
-	Users       []User       `json:"users"`
-	Tenants     []Tenant     `json:"tenants"`
-	Memberships []Membership `json:"memberships"`
+	Users           []userRecord     `json:"users"`
+	RevokedSessions []revokedSession `json:"revoked_sessions"`
 }
 
 type FileStore struct {
@@ -33,176 +55,49 @@ func NewFileStore(path string) (*FileStore, error) {
 	return s, nil
 }
 
-func (s *FileStore) CreateTenantOwner(channel Channel, identifier, tenantName string) (User, Tenant, Membership, error) {
+func (s *FileStore) CreateUser(email, passwordHash, passwordSalt, role string) (User, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	ds, err := s.loadLocked()
 	if err != nil {
-		return User{}, Tenant{}, Membership{}, err
+		return User{}, err
 	}
-
-	if _, ok := findUserByIdentity(ds.Users, channel, identifier); ok {
-		return User{}, Tenant{}, Membership{}, ErrUserExists
+	email = strings.ToLower(strings.TrimSpace(email))
+	if _, ok, _ := findCredentialByEmail(ds.Users, email); ok {
+		return User{}, ErrUserExists
 	}
 
 	now := time.Now().UTC()
-	tenant := Tenant{
-		ID:        newID("ten_"),
-		Name:      fallbackTenantName(identifier, tenantName),
-		PlanID:    "free",
-		Status:    "active",
-		CreatedAt: now,
+	rec := userRecord{
+		ID:           newID("usr_"),
+		Email:        email,
+		PasswordHash: strings.TrimSpace(passwordHash),
+		PasswordSalt: strings.TrimSpace(passwordSalt),
+		Role:         strings.ToLower(strings.TrimSpace(role)),
+		Status:       "active",
+		CreatedAt:    now,
+		UpdatedAt:    now,
 	}
-	user := User{
-		ID:        newID("usr_"),
-		TenantID:  tenant.ID,
-		Status:    "active",
-		CreatedAt: now,
-	}
-	assignIdentity(&user, channel, identifier)
-
-	membership := Membership{
-		TenantID: tenant.ID,
-		UserID:   user.ID,
-		Role:     "owner",
-		JoinedAt: now,
-	}
-
-	ds.Users = append(ds.Users, user)
-	ds.Tenants = append(ds.Tenants, tenant)
-	ds.Memberships = append(ds.Memberships, membership)
-
+	ds.Users = append(ds.Users, rec)
 	if err := s.saveLocked(ds); err != nil {
-		return User{}, Tenant{}, Membership{}, err
+		return User{}, err
 	}
-	return user, tenant, membership, nil
+	return toUser(rec), nil
 }
 
-func (s *FileStore) CreateTenantUser(tenantID string, channel Channel, identifier, role string) (TenantUser, error) {
+func (s *FileStore) FindCredentialByEmail(email string) (credential, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	ds, err := s.loadLocked()
 	if err != nil {
-		return TenantUser{}, err
+		return credential{}, false, err
 	}
-	tenantID = strings.TrimSpace(tenantID)
-	if tenantID == "" {
-		return TenantUser{}, ErrTenantNotFound
-	}
-	if _, ok := findTenantByID(ds.Tenants, tenantID); !ok {
-		return TenantUser{}, ErrTenantNotFound
-	}
-
-	if _, ok := findUserByIdentity(ds.Users, channel, identifier); ok {
-		return TenantUser{}, ErrUserExists
-	}
-
-	now := time.Now().UTC()
-	u := User{
-		ID:        newID("usr_"),
-		TenantID:  tenantID,
-		Status:    "active",
-		CreatedAt: now,
-	}
-	assignIdentity(&u, channel, identifier)
-
-	membership := Membership{
-		TenantID: tenantID,
-		UserID:   u.ID,
-		Role:     role,
-		JoinedAt: now,
-	}
-
-	ds.Users = append(ds.Users, u)
-	ds.Memberships = append(ds.Memberships, membership)
-	if err := s.saveLocked(ds); err != nil {
-		return TenantUser{}, err
-	}
-	return TenantUser{User: u, Role: role}, nil
+	return findCredentialByEmail(ds.Users, strings.ToLower(strings.TrimSpace(email)))
 }
 
-func (s *FileStore) UpdateTenantUserRole(tenantID, userID, role string) (TenantUser, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	ds, err := s.loadLocked()
-	if err != nil {
-		return TenantUser{}, err
-	}
-	tenantID = strings.TrimSpace(tenantID)
-	userID = strings.TrimSpace(userID)
-	if tenantID == "" || userID == "" {
-		return TenantUser{}, ErrUserNotFound
-	}
-
-	idx := -1
-	for i, m := range ds.Memberships {
-		if m.TenantID == tenantID && m.UserID == userID {
-			idx = i
-			break
-		}
-	}
-	if idx < 0 {
-		return TenantUser{}, ErrUserNotFound
-	}
-
-	current := ds.Memberships[idx]
-	if current.Role == "owner" && role != "owner" {
-		return TenantUser{}, ErrForbidden
-	}
-	ds.Memberships[idx].Role = role
-
-	if err := s.saveLocked(ds); err != nil {
-		return TenantUser{}, err
-	}
-
-	u, ok := findUserByID(ds.Users, userID)
-	if !ok {
-		return TenantUser{}, ErrUserNotFound
-	}
-	return TenantUser{User: u, Role: role}, nil
-}
-
-func (s *FileStore) UpdateTenantUserStatus(tenantID, userID, status string) (TenantUser, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	ds, err := s.loadLocked()
-	if err != nil {
-		return TenantUser{}, err
-	}
-	tenantID = strings.TrimSpace(tenantID)
-	userID = strings.TrimSpace(userID)
-	if tenantID == "" || userID == "" {
-		return TenantUser{}, ErrUserNotFound
-	}
-
-	membership, ok := findMembershipByTenantAndUserID(ds.Memberships, tenantID, userID)
-	if !ok {
-		return TenantUser{}, ErrUserNotFound
-	}
-
-	userIdx := -1
-	for i, u := range ds.Users {
-		if u.ID == userID && u.TenantID == tenantID {
-			userIdx = i
-			break
-		}
-	}
-	if userIdx < 0 {
-		return TenantUser{}, ErrUserNotFound
-	}
-	ds.Users[userIdx].Status = status
-
-	if err := s.saveLocked(ds); err != nil {
-		return TenantUser{}, err
-	}
-	return TenantUser{User: ds.Users[userIdx], Role: membership.Role}, nil
-}
-
-func (s *FileStore) FindUserByIdentity(channel Channel, identifier string) (User, bool, error) {
+func (s *FileStore) GetUserByID(userID string) (User, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -210,38 +105,15 @@ func (s *FileStore) FindUserByIdentity(channel Channel, identifier string) (User
 	if err != nil {
 		return User{}, false, err
 	}
-	u, ok := findUserByIdentity(ds.Users, channel, identifier)
-	return u, ok, nil
+	for _, rec := range ds.Users {
+		if rec.ID == userID {
+			return toUser(rec), true, nil
+		}
+	}
+	return User{}, false, nil
 }
 
-func (s *FileStore) GetSessionContext(userID string) (User, Membership, Tenant, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	ds, err := s.loadLocked()
-	if err != nil {
-		return User{}, Membership{}, Tenant{}, false, err
-	}
-
-	user, ok := findUserByID(ds.Users, userID)
-	if !ok {
-		return User{}, Membership{}, Tenant{}, false, nil
-	}
-
-	membership, ok := findMembershipByUserID(ds.Memberships, userID)
-	if !ok {
-		return User{}, Membership{}, Tenant{}, false, nil
-	}
-
-	tenant, ok := findTenantByID(ds.Tenants, membership.TenantID)
-	if !ok {
-		return User{}, Membership{}, Tenant{}, false, nil
-	}
-
-	return user, membership, tenant, true, nil
-}
-
-func (s *FileStore) ListTenantUsers(tenantID string) ([]TenantUser, error) {
+func (s *FileStore) ListUsers() ([]TenantUser, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -249,19 +121,205 @@ func (s *FileStore) ListTenantUsers(tenantID string) ([]TenantUser, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	out := make([]TenantUser, 0)
-	for _, m := range ds.Memberships {
-		if m.TenantID != tenantID {
-			continue
-		}
-		u, ok := findUserByID(ds.Users, m.UserID)
-		if !ok {
-			continue
-		}
-		out = append(out, TenantUser{User: u, Role: m.Role})
+	users := make([]userRecord, len(ds.Users))
+	copy(users, ds.Users)
+	sort.Slice(users, func(i, j int) bool {
+		return users[i].CreatedAt.Before(users[j].CreatedAt)
+	})
+	out := make([]TenantUser, 0, len(users))
+	for _, rec := range users {
+		u := toUser(rec)
+		out = append(out, TenantUser{User: u, Role: u.Role})
 	}
 	return out, nil
+}
+
+func (s *FileStore) UpdateUserRole(userID, role string) (TenantUser, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ds, err := s.loadLocked()
+	if err != nil {
+		return TenantUser{}, err
+	}
+
+	idx := indexOfUser(ds.Users, strings.TrimSpace(userID))
+	if idx < 0 {
+		return TenantUser{}, ErrUserNotFound
+	}
+	ds.Users[idx].Role = strings.ToLower(strings.TrimSpace(role))
+	ds.Users[idx].UpdatedAt = time.Now().UTC()
+	if err := s.saveLocked(ds); err != nil {
+		return TenantUser{}, err
+	}
+	u := toUser(ds.Users[idx])
+	return TenantUser{User: u, Role: u.Role}, nil
+}
+
+func (s *FileStore) UpdateUserStatus(userID, status string) (TenantUser, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ds, err := s.loadLocked()
+	if err != nil {
+		return TenantUser{}, err
+	}
+
+	idx := indexOfUser(ds.Users, strings.TrimSpace(userID))
+	if idx < 0 {
+		return TenantUser{}, ErrUserNotFound
+	}
+	ds.Users[idx].Status = strings.ToLower(strings.TrimSpace(status))
+	ds.Users[idx].UpdatedAt = time.Now().UTC()
+	if err := s.saveLocked(ds); err != nil {
+		return TenantUser{}, err
+	}
+	u := toUser(ds.Users[idx])
+	return TenantUser{User: u, Role: u.Role}, nil
+}
+
+func (s *FileStore) DeleteUser(userID string) (User, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ds, err := s.loadLocked()
+	if err != nil {
+		return User{}, err
+	}
+
+	idx := indexOfUser(ds.Users, strings.TrimSpace(userID))
+	if idx < 0 {
+		return User{}, ErrUserNotFound
+	}
+	deleted := toUser(ds.Users[idx])
+	ds.Users = append(ds.Users[:idx], ds.Users[idx+1:]...)
+	if err := s.saveLocked(ds); err != nil {
+		return User{}, err
+	}
+	return deleted, nil
+}
+
+func (s *FileStore) UserCount() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ds, err := s.loadLocked()
+	if err != nil {
+		return 0, err
+	}
+	return len(ds.Users), nil
+}
+
+func (s *FileStore) AnyAdminCount() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ds, err := s.loadLocked()
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, rec := range ds.Users {
+		if strings.ToLower(strings.TrimSpace(rec.Role)) == "admin" {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func (s *FileStore) AdminCount() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ds, err := s.loadLocked()
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, rec := range ds.Users {
+		if strings.ToLower(strings.TrimSpace(rec.Role)) == "admin" && strings.ToLower(strings.TrimSpace(rec.Status)) == "active" {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func (s *FileStore) CreateInitialAdmin(email, passwordHash, passwordSalt string) (User, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ds, err := s.loadLocked()
+	if err != nil {
+		return User{}, err
+	}
+
+	email = strings.ToLower(strings.TrimSpace(email))
+	if _, ok, _ := findCredentialByEmail(ds.Users, email); ok {
+		return User{}, ErrUserExists
+	}
+	for _, rec := range ds.Users {
+		if strings.ToLower(strings.TrimSpace(rec.Role)) == "admin" {
+			return User{}, ErrAdminBootstrapClosed
+		}
+	}
+
+	now := time.Now().UTC()
+	rec := userRecord{
+		ID:           newID("usr_"),
+		Email:        email,
+		PasswordHash: strings.TrimSpace(passwordHash),
+		PasswordSalt: strings.TrimSpace(passwordSalt),
+		Role:         "admin",
+		Status:       "active",
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	ds.Users = append(ds.Users, rec)
+	if err := s.saveLocked(ds); err != nil {
+		return User{}, err
+	}
+	return toUser(rec), nil
+}
+
+func (s *FileStore) RevokeSession(jti string, exp int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	jti = strings.TrimSpace(jti)
+	if jti == "" {
+		return ErrSessionTokenInvalid
+	}
+	ds, err := s.loadLocked()
+	if err != nil {
+		return err
+	}
+	for _, item := range ds.RevokedSessions {
+		if item.JTI == jti {
+			return nil
+		}
+	}
+	ds.RevokedSessions = append(ds.RevokedSessions, revokedSession{JTI: jti, Exp: exp, RevokedAt: time.Now().UTC()})
+	return s.saveLocked(ds)
+}
+
+func (s *FileStore) IsSessionRevoked(jti string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	jti = strings.TrimSpace(jti)
+	if jti == "" {
+		return true, nil
+	}
+	ds, err := s.loadLocked()
+	if err != nil {
+		return false, err
+	}
+	for _, item := range ds.RevokedSessions {
+		if item.JTI == jti {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (s *FileStore) ensureFile() error {
@@ -276,7 +334,7 @@ func (s *FileStore) ensureFile() error {
 		return err
 	}
 
-	empty := fileDataset{Users: []User{}, Tenants: []Tenant{}, Memberships: []Membership{}}
+	empty := fileDataset{Users: []userRecord{}, RevokedSessions: []revokedSession{}}
 	b, err := json.MarshalIndent(empty, "", "  ")
 	if err != nil {
 		return err
@@ -291,7 +349,7 @@ func (s *FileStore) loadLocked() (fileDataset, error) {
 		return fileDataset{}, err
 	}
 	if len(b) == 0 {
-		return fileDataset{Users: []User{}, Tenants: []Tenant{}, Memberships: []Membership{}}, nil
+		return fileDataset{Users: []userRecord{}, RevokedSessions: []revokedSession{}}, nil
 	}
 
 	var ds fileDataset
@@ -299,14 +357,20 @@ func (s *FileStore) loadLocked() (fileDataset, error) {
 		return fileDataset{}, err
 	}
 	if ds.Users == nil {
-		ds.Users = []User{}
+		ds.Users = []userRecord{}
 	}
-	if ds.Tenants == nil {
-		ds.Tenants = []Tenant{}
+	if ds.RevokedSessions == nil {
+		ds.RevokedSessions = []revokedSession{}
 	}
-	if ds.Memberships == nil {
-		ds.Memberships = []Membership{}
+
+	now := time.Now().UTC().Unix()
+	filtered := ds.RevokedSessions[:0]
+	for _, item := range ds.RevokedSessions {
+		if item.Exp <= 0 || item.Exp > now {
+			filtered = append(filtered, item)
+		}
 	}
+	ds.RevokedSessions = filtered
 	return ds, nil
 }
 
@@ -324,79 +388,31 @@ func (s *FileStore) saveLocked(ds fileDataset) error {
 	return os.Rename(tmp, s.path)
 }
 
-func findUserByIdentity(users []User, channel Channel, identifier string) (User, bool) {
-	for _, u := range users {
-		switch channel {
-		case ChannelPhone:
-			if u.Phone == identifier {
-				return u, true
-			}
-		case ChannelWeChat:
-			if u.WeChatOpenID == identifier {
-				return u, true
-			}
-		case ChannelFeishu:
-			if u.FeishuOpenID == identifier {
-				return u, true
-			}
+func findCredentialByEmail(users []userRecord, email string) (credential, bool, error) {
+	for _, rec := range users {
+		if strings.EqualFold(strings.TrimSpace(rec.Email), strings.TrimSpace(email)) {
+			return credential{User: toUser(rec), PasswordHash: rec.PasswordHash, PasswordSalt: rec.PasswordSalt}, true, nil
 		}
 	}
-	return User{}, false
+	return credential{}, false, nil
 }
 
-func findUserByID(users []User, userID string) (User, bool) {
-	for _, u := range users {
-		if u.ID == userID {
-			return u, true
+func indexOfUser(users []userRecord, userID string) int {
+	for i := range users {
+		if users[i].ID == userID {
+			return i
 		}
 	}
-	return User{}, false
+	return -1
 }
 
-func findMembershipByUserID(memberships []Membership, userID string) (Membership, bool) {
-	for _, m := range memberships {
-		if m.UserID == userID {
-			return m, true
-		}
+func toUser(rec userRecord) User {
+	return User{
+		ID:        rec.ID,
+		Email:     rec.Email,
+		Role:      rec.Role,
+		Status:    rec.Status,
+		CreatedAt: rec.CreatedAt,
+		UpdatedAt: rec.UpdatedAt,
 	}
-	return Membership{}, false
-}
-
-func findMembershipByTenantAndUserID(memberships []Membership, tenantID, userID string) (Membership, bool) {
-	for _, m := range memberships {
-		if m.TenantID == tenantID && m.UserID == userID {
-			return m, true
-		}
-	}
-	return Membership{}, false
-}
-
-func findTenantByID(tenants []Tenant, tenantID string) (Tenant, bool) {
-	for _, t := range tenants {
-		if t.ID == tenantID {
-			return t, true
-		}
-	}
-	return Tenant{}, false
-}
-
-func assignIdentity(user *User, channel Channel, identifier string) {
-	switch channel {
-	case ChannelPhone:
-		user.Phone = identifier
-	case ChannelWeChat:
-		user.WeChatOpenID = identifier
-	case ChannelFeishu:
-		user.FeishuOpenID = identifier
-	}
-}
-
-func fallbackTenantName(identifier, tenantName string) string {
-	if tenantName != "" {
-		return tenantName
-	}
-	if len(identifier) > 8 {
-		identifier = identifier[:8]
-	}
-	return fmt.Sprintf("opc-%s", identifier)
 }

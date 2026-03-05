@@ -23,9 +23,9 @@ func TestNewInitializesServer(t *testing.T) {
 		BillingStorePath:   filepath.Join(t.TempDir(), "billing.json"),
 		PromptAPIStorePath: filepath.Join(t.TempDir(), "prompt_apis.json"),
 		AuditStorePath:     filepath.Join(t.TempDir(), "audit.json"),
+		UpstreamStorePath:  filepath.Join(t.TempDir(), "upstreams.json"),
 		SessionSecret:      "test-secret",
 		SessionTTL:         24 * time.Hour,
-		PhoneTestCode:      "000000",
 		PolicyBackend:      "file",
 		PolicyStorePath:    filepath.Join(t.TempDir(), "policies.json"),
 	}
@@ -58,9 +58,9 @@ func TestRunReturnsListenError(t *testing.T) {
 		BillingStorePath:   filepath.Join(t.TempDir(), "billing.json"),
 		PromptAPIStorePath: filepath.Join(t.TempDir(), "prompt_apis.json"),
 		AuditStorePath:     filepath.Join(t.TempDir(), "audit.json"),
+		UpstreamStorePath:  filepath.Join(t.TempDir(), "upstreams.json"),
 		SessionSecret:      "test-secret",
 		SessionTTL:         24 * time.Hour,
-		PhoneTestCode:      "000000",
 		PolicyBackend:      "file",
 		PolicyStorePath:    filepath.Join(t.TempDir(), "policies.json"),
 	}

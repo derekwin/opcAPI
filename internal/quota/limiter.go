@@ -18,15 +18,21 @@ type RequestDecision struct {
 }
 
 type TokenDecision struct {
-	Allowed   bool
-	Limit     int
-	Remaining int
-	Reason    string
+	Allowed           bool
+	Limit             int
+	Remaining         int
+	FiveHourLimit     int
+	FiveHourRemaining int
+	MonthlyLimit      int
+	MonthlyRemaining  int
+	Reason            string
 }
 
 type KeyPolicy struct {
-	RPMLimit        int
-	DailyTokenLimit int
+	RPMLimit           int
+	DailyTokenLimit    int // legacy
+	FiveHourTokenLimit int
+	MonthlyTokenLimit  int
 }
 
 type minuteCounter struct {
@@ -39,6 +45,16 @@ type dailyTokenCounter struct {
 	used int
 }
 
+type fiveHourTokenCounter struct {
+	window string
+	used   int
+}
+
+type monthlyTokenCounter struct {
+	month string
+	used  int
+}
+
 type Limiter struct {
 	defaultRPMLimit        int
 	defaultDailyTokenLimit int
@@ -49,6 +65,8 @@ type Limiter struct {
 	mu            sync.RWMutex
 	reqCounters   map[string]minuteCounter
 	tokenCounters map[string]dailyTokenCounter
+	fiveHour      map[string]fiveHourTokenCounter
+	monthly       map[string]monthlyTokenCounter
 	policies      map[string]KeyPolicy
 
 	nowFn func() time.Time
@@ -60,6 +78,8 @@ func NewLimiter(rpmLimit, dailyTokenLimit int) *Limiter {
 		defaultDailyTokenLimit: dailyTokenLimit,
 		reqCounters:            make(map[string]minuteCounter),
 		tokenCounters:          make(map[string]dailyTokenCounter),
+		fiveHour:               make(map[string]fiveHourTokenCounter),
+		monthly:                make(map[string]monthlyTokenCounter),
 		policies:               make(map[string]KeyPolicy),
 		nowFn:                  time.Now,
 	}
@@ -91,6 +111,15 @@ func (l *Limiter) SetKeyPolicies(policies map[string]KeyPolicy) {
 	l.mu.Lock()
 	l.policies = cloned
 	l.mu.Unlock()
+}
+
+func (l *Limiter) SetKeyPolicy(key string, policy KeyPolicy) {
+	if l == nil || key == "" {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.policies[key] = policy
 }
 
 func (l *Limiter) AllowRequest(key string) RequestDecision {
@@ -173,11 +202,16 @@ func (l *Limiter) allowRequestMemory(key string) RequestDecision {
 
 func (l *Limiter) allowTokenUsageMemory(key string) TokenDecision {
 	dailyLimit := l.resolveDailyTokenLimit(key)
-	if dailyLimit <= 0 {
+	fiveHourLimit := l.resolveFiveHourTokenLimit(key)
+	monthlyLimit := l.resolveMonthlyTokenLimit(key)
+	if dailyLimit <= 0 && fiveHourLimit <= 0 && monthlyLimit <= 0 {
 		return TokenDecision{Allowed: true}
 	}
 
-	today := l.nowUTC().Format("2006-01-02")
+	now := l.nowUTC()
+	today := now.Format("2006-01-02")
+	fiveHourWindow := l.fiveHourBucket(now)
+	month := now.Format("200601")
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -187,8 +221,36 @@ func (l *Limiter) allowTokenUsageMemory(key string) TokenDecision {
 		counter.day = today
 		counter.used = 0
 	}
+	fh := l.fiveHour[key]
+	if fh.window != fiveHourWindow {
+		fh.window = fiveHourWindow
+		fh.used = 0
+	}
+	mon := l.monthly[key]
+	if mon.month != month {
+		mon.month = month
+		mon.used = 0
+	}
 
-	if counter.used >= dailyLimit {
+	if fiveHourLimit > 0 && fh.used >= fiveHourLimit {
+		l.fiveHour[key] = fh
+		return TokenDecision{
+			Allowed:           false,
+			FiveHourLimit:     fiveHourLimit,
+			FiveHourRemaining: 0,
+			Reason:            "five_hour_token_limit_exceeded",
+		}
+	}
+	if monthlyLimit > 0 && mon.used >= monthlyLimit {
+		l.monthly[key] = mon
+		return TokenDecision{
+			Allowed:          false,
+			MonthlyLimit:     monthlyLimit,
+			MonthlyRemaining: 0,
+			Reason:           "monthly_token_limit_exceeded",
+		}
+	}
+	if dailyLimit > 0 && counter.used >= dailyLimit {
 		l.tokenCounters[key] = counter
 		return TokenDecision{
 			Allowed:   false,
@@ -198,36 +260,84 @@ func (l *Limiter) allowTokenUsageMemory(key string) TokenDecision {
 		}
 	}
 
-	remaining := dailyLimit - counter.used
-	if remaining < 0 {
-		remaining = 0
+	remaining := 0
+	if dailyLimit > 0 {
+		remaining = dailyLimit - counter.used
+		if remaining < 0 {
+			remaining = 0
+		}
+	}
+	fiveHourRemaining := 0
+	if fiveHourLimit > 0 {
+		fiveHourRemaining = fiveHourLimit - fh.used
+		if fiveHourRemaining < 0 {
+			fiveHourRemaining = 0
+		}
+	}
+	monthlyRemaining := 0
+	if monthlyLimit > 0 {
+		monthlyRemaining = monthlyLimit - mon.used
+		if monthlyRemaining < 0 {
+			monthlyRemaining = 0
+		}
 	}
 	l.tokenCounters[key] = counter
+	l.fiveHour[key] = fh
+	l.monthly[key] = mon
 	return TokenDecision{
-		Allowed:   true,
-		Limit:     dailyLimit,
-		Remaining: remaining,
+		Allowed:           true,
+		Limit:             dailyLimit,
+		Remaining:         remaining,
+		FiveHourLimit:     fiveHourLimit,
+		FiveHourRemaining: fiveHourRemaining,
+		MonthlyLimit:      monthlyLimit,
+		MonthlyRemaining:  monthlyRemaining,
 	}
 }
 
 func (l *Limiter) addTokenUsageMemory(key string, tokens int) {
 	dailyLimit := l.resolveDailyTokenLimit(key)
-	if dailyLimit <= 0 || tokens <= 0 {
+	fiveHourLimit := l.resolveFiveHourTokenLimit(key)
+	monthlyLimit := l.resolveMonthlyTokenLimit(key)
+	if (dailyLimit <= 0 && fiveHourLimit <= 0 && monthlyLimit <= 0) || tokens <= 0 {
 		return
 	}
 
-	today := l.nowUTC().Format("2006-01-02")
+	now := l.nowUTC()
+	today := now.Format("2006-01-02")
+	fiveHourWindow := l.fiveHourBucket(now)
+	month := now.Format("200601")
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	counter := l.tokenCounters[key]
-	if counter.day != today {
-		counter.day = today
-		counter.used = 0
+	if dailyLimit > 0 {
+		counter := l.tokenCounters[key]
+		if counter.day != today {
+			counter.day = today
+			counter.used = 0
+		}
+		counter.used += tokens
+		l.tokenCounters[key] = counter
 	}
-	counter.used += tokens
-	l.tokenCounters[key] = counter
+	if fiveHourLimit > 0 {
+		fh := l.fiveHour[key]
+		if fh.window != fiveHourWindow {
+			fh.window = fiveHourWindow
+			fh.used = 0
+		}
+		fh.used += tokens
+		l.fiveHour[key] = fh
+	}
+	if monthlyLimit > 0 {
+		mon := l.monthly[key]
+		if mon.month != month {
+			mon.month = month
+			mon.used = 0
+		}
+		mon.used += tokens
+		l.monthly[key] = mon
+	}
 }
 
 func (l *Limiter) allowRequestRedis(key string) RequestDecision {
@@ -271,21 +381,68 @@ func (l *Limiter) allowRequestRedis(key string) RequestDecision {
 
 func (l *Limiter) allowTokenUsageRedis(key string) TokenDecision {
 	dailyLimit := l.resolveDailyTokenLimit(key)
-	if dailyLimit <= 0 {
+	fiveHourLimit := l.resolveFiveHourTokenLimit(key)
+	monthlyLimit := l.resolveMonthlyTokenLimit(key)
+	if dailyLimit <= 0 && fiveHourLimit <= 0 && monthlyLimit <= 0 {
 		return TokenDecision{Allowed: true}
 	}
 
-	day := l.nowUTC().Format("20060102")
-	redisKey := fmt.Sprintf("%s:tok:%s:%s", l.redisPrefix, key, day)
-	used, ok, err := l.redisClient.GetInt64(context.Background(), redisKey)
-	if err != nil {
-		return TokenDecision{Allowed: true, Limit: dailyLimit, Remaining: dailyLimit, Reason: "redis_unavailable"}
+	now := l.nowUTC()
+	day := now.Format("20060102")
+	month := now.Format("200601")
+	fiveHourWindow := l.fiveHourBucket(now)
+
+	dailyUsed := int64(0)
+	if dailyLimit > 0 {
+		redisKey := fmt.Sprintf("%s:tok:%s:%s", l.redisPrefix, key, day)
+		used, ok, err := l.redisClient.GetInt64(context.Background(), redisKey)
+		if err != nil {
+			return TokenDecision{Allowed: true, Limit: dailyLimit, Remaining: dailyLimit, Reason: "redis_unavailable"}
+		}
+		if ok {
+			dailyUsed = used
+		}
 	}
-	if !ok {
-		used = 0
+	fiveHourUsed := int64(0)
+	if fiveHourLimit > 0 {
+		redisKey := fmt.Sprintf("%s:tok5h:%s:%s", l.redisPrefix, key, fiveHourWindow)
+		used, ok, err := l.redisClient.GetInt64(context.Background(), redisKey)
+		if err != nil {
+			return TokenDecision{Allowed: true, FiveHourLimit: fiveHourLimit, FiveHourRemaining: fiveHourLimit, Reason: "redis_unavailable"}
+		}
+		if ok {
+			fiveHourUsed = used
+		}
+	}
+	monthlyUsed := int64(0)
+	if monthlyLimit > 0 {
+		redisKey := fmt.Sprintf("%s:tokm:%s:%s", l.redisPrefix, key, month)
+		used, ok, err := l.redisClient.GetInt64(context.Background(), redisKey)
+		if err != nil {
+			return TokenDecision{Allowed: true, MonthlyLimit: monthlyLimit, MonthlyRemaining: monthlyLimit, Reason: "redis_unavailable"}
+		}
+		if ok {
+			monthlyUsed = used
+		}
 	}
 
-	if int(used) >= dailyLimit {
+	if fiveHourLimit > 0 && int(fiveHourUsed) >= fiveHourLimit {
+		return TokenDecision{
+			Allowed:           false,
+			FiveHourLimit:     fiveHourLimit,
+			FiveHourRemaining: 0,
+			Reason:            "five_hour_token_limit_exceeded",
+		}
+	}
+	if monthlyLimit > 0 && int(monthlyUsed) >= monthlyLimit {
+		return TokenDecision{
+			Allowed:          false,
+			MonthlyLimit:     monthlyLimit,
+			MonthlyRemaining: 0,
+			Reason:           "monthly_token_limit_exceeded",
+		}
+	}
+	if dailyLimit > 0 && int(dailyUsed) >= dailyLimit {
 		return TokenDecision{
 			Allowed:   false,
 			Limit:     dailyLimit,
@@ -294,25 +451,68 @@ func (l *Limiter) allowTokenUsageRedis(key string) TokenDecision {
 		}
 	}
 
-	remaining := dailyLimit - int(used)
-	if remaining < 0 {
-		remaining = 0
+	remaining := 0
+	if dailyLimit > 0 {
+		remaining = dailyLimit - int(dailyUsed)
+		if remaining < 0 {
+			remaining = 0
+		}
 	}
-	return TokenDecision{Allowed: true, Limit: dailyLimit, Remaining: remaining}
+	fiveHourRemaining := 0
+	if fiveHourLimit > 0 {
+		fiveHourRemaining = fiveHourLimit - int(fiveHourUsed)
+		if fiveHourRemaining < 0 {
+			fiveHourRemaining = 0
+		}
+	}
+	monthlyRemaining := 0
+	if monthlyLimit > 0 {
+		monthlyRemaining = monthlyLimit - int(monthlyUsed)
+		if monthlyRemaining < 0 {
+			monthlyRemaining = 0
+		}
+	}
+	return TokenDecision{
+		Allowed:           true,
+		Limit:             dailyLimit,
+		Remaining:         remaining,
+		FiveHourLimit:     fiveHourLimit,
+		FiveHourRemaining: fiveHourRemaining,
+		MonthlyLimit:      monthlyLimit,
+		MonthlyRemaining:  monthlyRemaining,
+	}
 }
 
 func (l *Limiter) addTokenUsageRedis(key string, tokens int) {
 	dailyLimit := l.resolveDailyTokenLimit(key)
-	if dailyLimit <= 0 || tokens <= 0 {
+	fiveHourLimit := l.resolveFiveHourTokenLimit(key)
+	monthlyLimit := l.resolveMonthlyTokenLimit(key)
+	if (dailyLimit <= 0 && fiveHourLimit <= 0 && monthlyLimit <= 0) || tokens <= 0 {
 		return
 	}
 
-	day := l.nowUTC().Format("20060102")
-	redisKey := fmt.Sprintf("%s:tok:%s:%s", l.redisPrefix, key, day)
-	if _, err := l.redisClient.IncrBy(context.Background(), redisKey, int64(tokens)); err != nil {
-		return
+	now := l.nowUTC()
+	day := now.Format("20060102")
+	if dailyLimit > 0 {
+		redisKey := fmt.Sprintf("%s:tok:%s:%s", l.redisPrefix, key, day)
+		if _, err := l.redisClient.IncrBy(context.Background(), redisKey, int64(tokens)); err == nil {
+			_ = l.redisClient.Expire(context.Background(), redisKey, 48*time.Hour)
+		}
 	}
-	_ = l.redisClient.Expire(context.Background(), redisKey, 48*time.Hour)
+	if fiveHourLimit > 0 {
+		fiveHourWindow := l.fiveHourBucket(now)
+		redisKey := fmt.Sprintf("%s:tok5h:%s:%s", l.redisPrefix, key, fiveHourWindow)
+		if _, err := l.redisClient.IncrBy(context.Background(), redisKey, int64(tokens)); err == nil {
+			_ = l.redisClient.Expire(context.Background(), redisKey, 8*time.Hour)
+		}
+	}
+	if monthlyLimit > 0 {
+		month := now.Format("200601")
+		redisKey := fmt.Sprintf("%s:tokm:%s:%s", l.redisPrefix, key, month)
+		if _, err := l.redisClient.IncrBy(context.Background(), redisKey, int64(tokens)); err == nil {
+			_ = l.redisClient.Expire(context.Background(), redisKey, 40*24*time.Hour)
+		}
+	}
 }
 
 func (l *Limiter) resolveRPMLimit(key string) int {
@@ -339,6 +539,36 @@ func (l *Limiter) resolveDailyTokenLimit(key string) int {
 		return policy.DailyTokenLimit
 	}
 	return l.defaultDailyTokenLimit
+}
+
+func (l *Limiter) resolveFiveHourTokenLimit(key string) int {
+	if l == nil {
+		return 0
+	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if policy, ok := l.policies[key]; ok {
+		return policy.FiveHourTokenLimit
+	}
+	return 0
+}
+
+func (l *Limiter) resolveMonthlyTokenLimit(key string) int {
+	if l == nil {
+		return 0
+	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if policy, ok := l.policies[key]; ok {
+		return policy.MonthlyTokenLimit
+	}
+	return 0
+}
+
+func (l *Limiter) fiveHourBucket(now time.Time) string {
+	utc := now.UTC()
+	block := (utc.Hour() / 5) * 5
+	return fmt.Sprintf("%04d%02d%02d%02d", utc.Year(), int(utc.Month()), utc.Day(), block)
 }
 
 func (l *Limiter) nowUTC() time.Time {

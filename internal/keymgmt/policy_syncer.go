@@ -32,34 +32,47 @@ type persistedPolicies struct {
 type persistedPolicy struct {
 	APIKey          string `json:"api_key,omitempty"`
 	KeyHash         string `json:"key_hash,omitempty"`
-	TenantID        string `json:"tenant_id,omitempty"`
+	UserID          string `json:"user_id,omitempty"`
+	TenantID        string `json:"tenant_id,omitempty"` // backward compatibility for old data
 	Enabled         bool   `json:"enabled"`
 	RPMLimit        int    `json:"rpm_limit"`
 	DailyTokenLimit int    `json:"daily_token_limit"`
+	PaidEnabled     bool   `json:"paid_enabled,omitempty"`
+	PlanTier        string `json:"plan_tier,omitempty"`
 }
 
 type PolicyRecord struct {
 	KeyHash         string `json:"key_hash"`
-	TenantID        string `json:"tenant_id,omitempty"`
+	UserID          string `json:"user_id,omitempty"`
 	Enabled         bool   `json:"enabled"`
 	RPMLimit        int    `json:"rpm_limit"`
 	DailyTokenLimit int    `json:"daily_token_limit"`
+	PaidEnabled     bool   `json:"paid_enabled"`
+	PlanTier        string `json:"plan_tier"`
+
+	TenantID string `json:"-"` // compatibility field for old in-repo call sites
 }
 
 type UpsertPolicyInput struct {
 	APIKey          string
 	KeyHash         string
-	TenantID        *string
+	UserID          *string
 	Enabled         *bool
 	RPMLimit        *int
 	DailyTokenLimit *int
+	PaidEnabled     *bool
+	PlanTier        *string
+
+	TenantID *string // compatibility alias, ignored when UserID is present
 }
 
 type ListQuery struct {
-	TenantID string
-	Enabled  *bool
-	Limit    int
-	Offset   int
+	UserID  string
+	Enabled *bool
+	Limit   int
+	Offset  int
+
+	TenantID string // compatibility alias
 }
 
 type PolicySyncer struct {
@@ -80,7 +93,7 @@ type PolicySyncer struct {
 
 	once    sync.Once
 	stateMu sync.RWMutex
-	tenants map[string]string
+	users   map[string]string
 }
 
 func NewPolicySyncer(cfg config.Config, logger *slog.Logger, authManager *auth.Manager, limiter *quota.Limiter, redisClient *redisstore.Client) *PolicySyncer {
@@ -116,7 +129,7 @@ func NewPolicySyncer(cfg config.Config, logger *slog.Logger, authManager *auth.M
 		defaultRPMLimit: cfg.RequestRPMLimit,
 		defaultDaily:    cfg.DailyTokenLimit,
 		defaultKeys:     parseDefaultKeys(cfg.APIKeys),
-		tenants:         make(map[string]string),
+		users:           make(map[string]string),
 	}
 }
 
@@ -124,16 +137,10 @@ func (s *PolicySyncer) Initialize(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
-
 	if err := s.ensureStore(ctx); err != nil {
 		return err
 	}
-
-	if err := s.LoadOnce(ctx); err != nil {
-		return err
-	}
-
-	return nil
+	return s.LoadOnce(ctx)
 }
 
 func (s *PolicySyncer) Start(ctx context.Context) {
@@ -173,7 +180,7 @@ func (s *PolicySyncer) LoadOnce(ctx context.Context) error {
 
 	hashes := make([]string, 0, len(payload.Keys))
 	policies := make(map[string]quota.KeyPolicy, len(payload.Keys))
-	tenants := make(map[string]string, len(payload.Keys))
+	users := make(map[string]string, len(payload.Keys))
 
 	for _, item := range payload.Keys {
 		h := resolvePolicyHash(item)
@@ -181,20 +188,12 @@ func (s *PolicySyncer) LoadOnce(ctx context.Context) error {
 			continue
 		}
 
-		rpm := item.RPMLimit
-		if rpm <= 0 {
-			rpm = s.defaultRPMLimit
-		}
-		daily := item.DailyTokenLimit
-		if daily <= 0 {
-			daily = s.defaultDaily
-		}
-
+		rpm, daily := s.resolveLimits(item)
 		if item.Enabled {
 			hashes = append(hashes, h)
 			policies[h] = quota.KeyPolicy{RPMLimit: rpm, DailyTokenLimit: daily}
-			if tenantID := strings.TrimSpace(item.TenantID); tenantID != "" {
-				tenants[h] = tenantID
+			if userID := normalizeUserID(item.UserID, item.TenantID); userID != "" {
+				users[h] = userID
 			}
 		}
 	}
@@ -206,7 +205,7 @@ func (s *PolicySyncer) LoadOnce(ctx context.Context) error {
 		s.limiter.SetKeyPolicies(policies)
 	}
 	s.stateMu.Lock()
-	s.tenants = tenants
+	s.users = users
 	s.stateMu.Unlock()
 
 	if s.logger != nil {
@@ -215,7 +214,29 @@ func (s *PolicySyncer) LoadOnce(ctx context.Context) error {
 	return nil
 }
 
-func (s *PolicySyncer) ResolveTenantByKeyHash(keyHash string) string {
+func (s *PolicySyncer) resolveLimits(item persistedPolicy) (int, int) {
+	rpm := item.RPMLimit
+	daily := item.DailyTokenLimit
+
+	if item.PaidEnabled {
+		planRPM, planDaily := planLimits(item.PlanTier)
+		if rpm <= 0 {
+			rpm = planRPM
+		}
+		if daily <= 0 {
+			daily = planDaily
+		}
+	}
+	if rpm <= 0 {
+		rpm = s.defaultRPMLimit
+	}
+	if daily <= 0 {
+		daily = s.defaultDaily
+	}
+	return rpm, daily
+}
+
+func (s *PolicySyncer) ResolveUserByKeyHash(keyHash string) string {
 	if s == nil {
 		return ""
 	}
@@ -226,14 +247,18 @@ func (s *PolicySyncer) ResolveTenantByKeyHash(keyHash string) string {
 
 	s.stateMu.RLock()
 	defer s.stateMu.RUnlock()
-	return s.tenants[keyHash]
+	return s.users[keyHash]
+}
+
+// ResolveTenantByKeyHash keeps compatibility with previous code paths.
+func (s *PolicySyncer) ResolveTenantByKeyHash(keyHash string) string {
+	return s.ResolveUserByKeyHash(keyHash)
 }
 
 func (s *PolicySyncer) List(ctx context.Context, query ListQuery) ([]PolicyRecord, int, error) {
 	if s == nil {
 		return nil, 0, nil
 	}
-
 	if err := s.ensureStore(ctx); err != nil {
 		return nil, 0, err
 	}
@@ -248,29 +273,29 @@ func (s *PolicySyncer) List(ctx context.Context, query ListQuery) ([]PolicyRecor
 		return nil, 0, err
 	}
 
-	tenantID := strings.TrimSpace(query.TenantID)
+	userID := strings.TrimSpace(query.UserID)
+	if userID == "" {
+		userID = strings.TrimSpace(query.TenantID)
+	}
+
 	out := make([]PolicyRecord, 0, len(payload.Keys))
 	for _, item := range payload.Keys {
 		keyHash := resolvePolicyHash(item)
 		if keyHash == "" {
 			continue
 		}
-		rpm := item.RPMLimit
-		if rpm <= 0 {
-			rpm = s.defaultRPMLimit
-		}
-		daily := item.DailyTokenLimit
-		if daily <= 0 {
-			daily = s.defaultDaily
-		}
+		rpm, daily := s.resolveLimits(item)
 		record := PolicyRecord{
 			KeyHash:         keyHash,
-			TenantID:        strings.TrimSpace(item.TenantID),
+			UserID:          normalizeUserID(item.UserID, item.TenantID),
 			Enabled:         item.Enabled,
 			RPMLimit:        rpm,
 			DailyTokenLimit: daily,
+			PaidEnabled:     item.PaidEnabled,
+			PlanTier:        normalizePlanTier(item.PlanTier),
 		}
-		if tenantID != "" && record.TenantID != tenantID {
+		record.TenantID = record.UserID
+		if userID != "" && record.UserID != userID {
 			continue
 		}
 		if query.Enabled != nil && record.Enabled != *query.Enabled {
@@ -309,7 +334,6 @@ func (s *PolicySyncer) Upsert(ctx context.Context, input UpsertPolicyInput) (Pol
 	if s == nil {
 		return PolicyRecord{}, ErrInvalidPolicy
 	}
-
 	if err := s.ensureStore(ctx); err != nil {
 		return PolicyRecord{}, err
 	}
@@ -340,6 +364,8 @@ func (s *PolicySyncer) Upsert(ctx context.Context, input UpsertPolicyInput) (Pol
 		Enabled:         true,
 		RPMLimit:        s.defaultRPMLimit,
 		DailyTokenLimit: s.defaultDaily,
+		PaidEnabled:     false,
+		PlanTier:        "free",
 	}
 	if idx >= 0 {
 		existing := payload.Keys[idx]
@@ -350,24 +376,55 @@ func (s *PolicySyncer) Upsert(ctx context.Context, input UpsertPolicyInput) (Pol
 		if existing.DailyTokenLimit > 0 {
 			base.DailyTokenLimit = existing.DailyTokenLimit
 		}
-		base.TenantID = strings.TrimSpace(existing.TenantID)
+		base.UserID = normalizeUserID(existing.UserID, existing.TenantID)
+		base.PaidEnabled = existing.PaidEnabled
+		base.PlanTier = normalizePlanTier(existing.PlanTier)
 	}
 
-	if input.TenantID != nil {
-		tenant := strings.TrimSpace(*input.TenantID)
-		if len(tenant) > 128 {
+	resolvedUser := ""
+	if input.UserID != nil {
+		resolvedUser = strings.TrimSpace(*input.UserID)
+	} else if input.TenantID != nil {
+		resolvedUser = strings.TrimSpace(*input.TenantID)
+	}
+	if input.UserID != nil || input.TenantID != nil {
+		if len(resolvedUser) > 128 {
 			return PolicyRecord{}, ErrInvalidPolicy
 		}
-		base.TenantID = tenant
+		base.UserID = resolvedUser
 	}
 	if input.Enabled != nil {
 		base.Enabled = *input.Enabled
 	}
+	if input.PaidEnabled != nil {
+		base.PaidEnabled = *input.PaidEnabled
+	}
+	if input.PlanTier != nil {
+		normalized := normalizePlanTier(*input.PlanTier)
+		if normalized == "" {
+			return PolicyRecord{}, ErrInvalidPolicy
+		}
+		base.PlanTier = normalized
+	}
+	if base.PlanTier == "" {
+		base.PlanTier = "free"
+	}
+
 	if input.RPMLimit != nil && *input.RPMLimit > 0 {
 		base.RPMLimit = *input.RPMLimit
 	}
 	if input.DailyTokenLimit != nil && *input.DailyTokenLimit > 0 {
 		base.DailyTokenLimit = *input.DailyTokenLimit
+	}
+
+	if base.PaidEnabled {
+		planRPM, planDaily := planLimits(base.PlanTier)
+		if input.RPMLimit == nil {
+			base.RPMLimit = maxInt(base.RPMLimit, planRPM)
+		}
+		if input.DailyTokenLimit == nil {
+			base.DailyTokenLimit = maxInt(base.DailyTokenLimit, planDaily)
+		}
 	}
 
 	if idx >= 0 {
@@ -383,24 +440,27 @@ func (s *PolicySyncer) Upsert(ctx context.Context, input UpsertPolicyInput) (Pol
 		return PolicyRecord{}, err
 	}
 
-	return PolicyRecord{
+	record := PolicyRecord{
 		KeyHash:         keyHash,
-		TenantID:        base.TenantID,
+		UserID:          base.UserID,
 		Enabled:         base.Enabled,
 		RPMLimit:        base.RPMLimit,
 		DailyTokenLimit: base.DailyTokenLimit,
-	}, nil
+		PaidEnabled:     base.PaidEnabled,
+		PlanTier:        base.PlanTier,
+	}
+	record.TenantID = record.UserID
+	return record, nil
 }
 
 func (s *PolicySyncer) Delete(ctx context.Context, keyHash string) error {
-	return s.DeleteForTenant(ctx, keyHash, "")
+	return s.DeleteForUser(ctx, keyHash, "")
 }
 
-func (s *PolicySyncer) DeleteForTenant(ctx context.Context, keyHash, tenantID string) error {
+func (s *PolicySyncer) DeleteForUser(ctx context.Context, keyHash, userID string) error {
 	if s == nil {
 		return ErrInvalidPolicy
 	}
-
 	if err := s.ensureStore(ctx); err != nil {
 		return err
 	}
@@ -409,7 +469,7 @@ func (s *PolicySyncer) DeleteForTenant(ctx context.Context, keyHash, tenantID st
 	if keyHash == "" {
 		return ErrInvalidPolicy
 	}
-	tenantID = strings.TrimSpace(tenantID)
+	userID = strings.TrimSpace(userID)
 
 	payload, err := s.loadPayload(ctx)
 	if err != nil {
@@ -421,7 +481,7 @@ func (s *PolicySyncer) DeleteForTenant(ctx context.Context, keyHash, tenantID st
 		if resolvePolicyHash(item) != keyHash {
 			continue
 		}
-		if tenantID != "" && strings.TrimSpace(item.TenantID) != tenantID {
+		if userID != "" && normalizeUserID(item.UserID, item.TenantID) != userID {
 			return ErrPolicyNotFound
 		}
 		idx = i
@@ -436,6 +496,11 @@ func (s *PolicySyncer) DeleteForTenant(ctx context.Context, keyHash, tenantID st
 		return err
 	}
 	return s.LoadOnce(ctx)
+}
+
+// DeleteForTenant keeps compatibility with previous code paths.
+func (s *PolicySyncer) DeleteForTenant(ctx context.Context, keyHash, tenantID string) error {
+	return s.DeleteForUser(ctx, keyHash, tenantID)
 }
 
 func (s *PolicySyncer) ensureStore(ctx context.Context) error {
@@ -573,6 +638,8 @@ func (s *PolicySyncer) defaultPayloadBytes() ([]byte, error) {
 			Enabled:         true,
 			RPMLimit:        s.defaultRPMLimit,
 			DailyTokenLimit: s.defaultDaily,
+			PaidEnabled:     false,
+			PlanTier:        "free",
 		})
 	}
 
@@ -620,15 +687,55 @@ func resolveDefaultKeyHash(key string) string {
 	return auth.HashAPIKey(v)
 }
 
-func normalizeHash(hash string) string {
-	v := strings.ToLower(strings.TrimSpace(hash))
-	if len(v) != 64 {
+func normalizeHash(raw string) string {
+	h := strings.ToLower(strings.TrimSpace(raw))
+	if len(h) != 64 {
 		return ""
 	}
-	for _, ch := range v {
-		if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')) {
+	for _, ch := range h {
+		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') {
 			return ""
 		}
 	}
-	return v
+	return h
+}
+
+func normalizeUserID(userID, tenantID string) string {
+	uid := strings.TrimSpace(userID)
+	if uid != "" {
+		return uid
+	}
+	return strings.TrimSpace(tenantID)
+}
+
+func normalizePlanTier(raw string) string {
+	v := strings.ToLower(strings.TrimSpace(raw))
+	switch v {
+	case "", "free":
+		return "free"
+	case "starter", "pro", "business":
+		return v
+	default:
+		return ""
+	}
+}
+
+func planLimits(tierRaw string) (int, int) {
+	switch normalizePlanTier(tierRaw) {
+	case "starter":
+		return 300, 5_000_000
+	case "pro":
+		return 1_000, 20_000_000
+	case "business":
+		return 5_000, 100_000_000
+	default:
+		return 120, 1_000_000
+	}
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

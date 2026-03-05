@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/derekwin/opcAPI/internal/auth"
+	"github.com/derekwin/opcAPI/internal/billing"
 	"github.com/derekwin/opcAPI/internal/quota"
 	"github.com/derekwin/opcAPI/internal/user"
 )
@@ -21,6 +22,7 @@ const (
 	requestIDKey contextKey = "request_id"
 	apiKeyKey    contextKey = "api_key"
 	sessionKey   contextKey = "session"
+	sessionToken contextKey = "session_token"
 )
 
 var requestCounter uint64
@@ -75,12 +77,9 @@ func requestQuota(limiter *quota.Limiter) func(http.Handler) http.Handler {
 				return
 			}
 
-			apiKey := APIKeyFromContext(r.Context())
-			if apiKey == "" {
-				apiKey = "anonymous"
-			}
+			subject := quotaSubjectFromContext(r.Context())
 
-			decision := limiter.AllowRequest(apiKey)
+			decision := limiter.AllowRequest(subject)
 			if !decision.Allowed {
 				if decision.RetryAfterSec > 0 {
 					w.Header().Set("Retry-After", fmt.Sprintf("%d", decision.RetryAfterSec))
@@ -98,6 +97,44 @@ func requestQuota(limiter *quota.Limiter) func(http.Handler) http.Handler {
 	}
 }
 
+func membershipQuotaPolicy(billingService *billing.Service, limiter *quota.Limiter) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if billingService == nil || limiter == nil {
+				next.ServeHTTP(w, r)
+				return
+			}
+			claims := SessionClaimsFromContext(r.Context())
+			userID := strings.TrimSpace(claims.UserID)
+			if userID != "" {
+				p, err := billingService.ResolveUsagePolicy(r.Context(), userID)
+				if err != nil {
+					p = billing.FreeUsagePolicy()
+				}
+				limiter.SetKeyPolicy(quotaSubjectFromContext(r.Context()), quota.KeyPolicy{
+					RPMLimit:           p.RPMLimit,
+					DailyTokenLimit:    0,
+					FiveHourTokenLimit: p.FiveHourTokenLimit,
+					MonthlyTokenLimit:  p.MonthlyTokenLimit,
+				})
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func quotaSubjectFromContext(ctx context.Context) string {
+	claims := SessionClaimsFromContext(ctx)
+	if userID := strings.TrimSpace(claims.UserID); userID != "" {
+		return "user:" + userID
+	}
+	apiKey := APIKeyFromContext(ctx)
+	if apiKey != "" {
+		return apiKey
+	}
+	return "anonymous"
+}
+
 func sessionAuth(userService *user.Service) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -112,24 +149,14 @@ func sessionAuth(userService *user.Service) func(http.Handler) http.Handler {
 				return
 			}
 
-			claims, err := userService.ParseSessionToken(token)
+			claims, err := userService.ValidateSessionToken(token)
 			if err != nil {
 				writeOpenAIError(w, r, http.StatusUnauthorized, "invalid_session", "authentication_error", err.Error(), "authorization")
 				return
 			}
-			if _, err := userService.GetMe(r.Context(), claims); err != nil {
-				switch {
-				case errors.Is(err, user.ErrUserDisabled):
-					writeOpenAIError(w, r, http.StatusForbidden, "user_disabled", "permission_error", "user disabled", "user")
-				case errors.Is(err, user.ErrUserNotFound):
-					writeOpenAIError(w, r, http.StatusUnauthorized, "invalid_session", "authentication_error", "user not found", "authorization")
-				default:
-					writeOpenAIError(w, r, http.StatusUnauthorized, "invalid_session", "authentication_error", "invalid session", "authorization")
-				}
-				return
-			}
 
 			ctx := context.WithValue(r.Context(), sessionKey, claims)
+			ctx = context.WithValue(ctx, sessionToken, token)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
@@ -139,7 +166,7 @@ func requireAdminRole() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			claims := SessionClaimsFromContext(r.Context())
-			if claims.Role != "owner" && claims.Role != "admin" {
+			if claims.Role != "admin" {
 				writeOpenAIError(w, r, http.StatusForbidden, "forbidden", "permission_error", "forbidden", "role")
 				return
 			}
@@ -200,6 +227,13 @@ func SessionClaimsFromContext(ctx context.Context) user.SessionClaims {
 		return v
 	}
 	return user.SessionClaims{}
+}
+
+func SessionTokenFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(sessionToken).(string); ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
 }
 
 func bearerToken(header string) (string, error) {

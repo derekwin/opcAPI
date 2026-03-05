@@ -22,11 +22,6 @@ func (h *handler) adminPromptAPIUpsert(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, r, http.StatusServiceUnavailable, "prompt_api_unavailable", "server_error", "prompt api service unavailable", "service")
 		return
 	}
-	claims := SessionClaimsFromContext(r.Context())
-	if claims.TenantID == "" {
-		writeOpenAIError(w, r, http.StatusUnauthorized, "invalid_session", "authentication_error", "invalid session", "authorization")
-		return
-	}
 	defer r.Body.Close()
 
 	var req promptapi.UpsertRequest
@@ -35,7 +30,7 @@ func (h *handler) adminPromptAPIUpsert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	def, err := h.promptAPI.Upsert(r.Context(), claims.TenantID, req)
+	def, err := h.promptAPI.Upsert(r.Context(), req)
 	if err != nil {
 		writePromptAPIError(w, r, err)
 		return
@@ -46,11 +41,6 @@ func (h *handler) adminPromptAPIUpsert(w http.ResponseWriter, r *http.Request) {
 func (h *handler) adminPromptAPIList(w http.ResponseWriter, r *http.Request) {
 	if h.promptAPI == nil {
 		writeOpenAIError(w, r, http.StatusServiceUnavailable, "prompt_api_unavailable", "server_error", "prompt api service unavailable", "service")
-		return
-	}
-	claims := SessionClaimsFromContext(r.Context())
-	if claims.TenantID == "" {
-		writeOpenAIError(w, r, http.StatusUnauthorized, "invalid_session", "authentication_error", "invalid session", "authorization")
 		return
 	}
 
@@ -68,10 +58,9 @@ func (h *handler) adminPromptAPIList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	page, err := h.promptAPI.List(r.Context(), promptapi.ListQuery{
-		TenantID: claims.TenantID,
-		Status:   r.URL.Query().Get("status"),
-		Limit:    limit,
-		Offset:   offset,
+		Status: r.URL.Query().Get("status"),
+		Limit:  limit,
+		Offset: offset,
 	})
 	if err != nil {
 		writePromptAPIError(w, r, err)
@@ -85,6 +74,44 @@ func (h *handler) adminPromptAPIList(w http.ResponseWriter, r *http.Request) {
 			"limit":  page.Limit,
 			"offset": page.Offset,
 			"count":  len(page.Data),
+		},
+	})
+}
+
+func (h *handler) adminDefaultAPIUpsert(w http.ResponseWriter, r *http.Request) {
+	if h.promptAPI == nil {
+		writeOpenAIError(w, r, http.StatusServiceUnavailable, "prompt_api_unavailable", "server_error", "prompt api service unavailable", "service")
+		return
+	}
+	defer r.Body.Close()
+
+	var req promptapi.UpsertDefaultAPIRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeOpenAIError(w, r, http.StatusBadRequest, "invalid_json", "invalid_request_error", "invalid JSON request body", "body")
+		return
+	}
+	cfg, err := h.promptAPI.UpsertDefaultAPI(r.Context(), req)
+	if err != nil {
+		writePromptAPIError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": cfg})
+}
+
+func (h *handler) adminDefaultAPIList(w http.ResponseWriter, r *http.Request) {
+	if h.promptAPI == nil {
+		writeOpenAIError(w, r, http.StatusServiceUnavailable, "prompt_api_unavailable", "server_error", "prompt api service unavailable", "service")
+		return
+	}
+	items, err := h.promptAPI.ListDefaultAPIs(r.Context())
+	if err != nil {
+		writePromptAPIError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"data": items,
+		"meta": map[string]any{
+			"count": len(items),
 		},
 	})
 }
@@ -117,30 +144,26 @@ func (h *handler) promptAPIInvoke(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, r, http.StatusBadRequest, "missing_input", "invalid_request_error", "input is required", "input")
 		return
 	}
+	mergePromptInputFromHeaders(req.Input, r.Header)
 
-	apiKey := APIKeyFromContext(r.Context())
-	tenantID := ""
-	if h.policySync != nil {
-		tenantID = strings.TrimSpace(h.policySync.ResolveTenantByKeyHash(apiKey))
-	}
-	if tenantID == "" {
-		writeOpenAIError(w, r, http.StatusForbidden, "tenant_binding_required", "permission_error", "api key is not bound to tenant", "tenant_id")
-		return
-	}
-
+	subject := quotaSubjectFromContext(r.Context())
 	if h.limiter != nil {
-		tokenDecision := h.limiter.AllowTokenUsage(apiKey)
+		tokenDecision := h.limiter.AllowTokenUsage(subject)
 		if !tokenDecision.Allowed {
-			writeOpenAIError(w, r, http.StatusTooManyRequests, tokenDecision.Reason, "rate_limit_error", "daily token limit exceeded", "token_limit")
+			writeOpenAIError(w, r, http.StatusTooManyRequests, tokenDecision.Reason, "rate_limit_error", "token usage limit exceeded", "token_limit")
 			return
 		}
-		if tokenDecision.Limit > 0 {
-			w.Header().Set("X-TokenLimit-Daily", fmt.Sprintf("%d", tokenDecision.Limit))
-			w.Header().Set("X-TokenLimit-Remaining-Daily", fmt.Sprintf("%d", tokenDecision.Remaining))
+		if tokenDecision.FiveHourLimit > 0 {
+			w.Header().Set("X-TokenLimit-5H", fmt.Sprintf("%d", tokenDecision.FiveHourLimit))
+			w.Header().Set("X-TokenLimit-Remaining-5H", fmt.Sprintf("%d", tokenDecision.FiveHourRemaining))
+		}
+		if tokenDecision.MonthlyLimit > 0 {
+			w.Header().Set("X-TokenLimit-Monthly", fmt.Sprintf("%d", tokenDecision.MonthlyLimit))
+			w.Header().Set("X-TokenLimit-Remaining-Monthly", fmt.Sprintf("%d", tokenDecision.MonthlyRemaining))
 		}
 	}
 
-	def, providerReq, err := h.promptAPI.BuildChatRequest(r.Context(), tenantID, slug, req.Input)
+	def, providerReq, err := h.promptAPI.BuildChatRequest(r.Context(), slug, req.Input)
 	if err != nil {
 		writePromptAPIError(w, r, err)
 		return
@@ -154,10 +177,7 @@ func (h *handler) promptAPIInvoke(w http.ResponseWriter, r *http.Request) {
 	}
 
 	reply := strings.TrimSpace(result.Content)
-	resModel := result.Model
-	if strings.TrimSpace(resModel) == "" {
-		resModel = providerReq.Model
-	}
+	resModel := "promptapi/" + def.Slug
 
 	id := "chatcmpl-" + shortID()
 	created := time.Now().Unix()
@@ -167,11 +187,7 @@ func (h *handler) promptAPIInvoke(w http.ResponseWriter, r *http.Request) {
 		TotalTokens:      result.PromptTokens + result.CompletionTokens,
 	}
 	if h.limiter != nil && usageVal.TotalTokens > 0 {
-		h.limiter.AddTokenUsage(apiKey, usageVal.TotalTokens)
-	}
-	if err := h.applyUsageBilling(r, tenantID, usageVal); err != nil {
-		writeInferenceBillingError(w, r, err)
-		return
+		h.limiter.AddTokenUsage(subject, usageVal.TotalTokens)
 	}
 
 	if req.Stream {
@@ -204,6 +220,31 @@ func (h *handler) promptAPIInvoke(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func mergePromptInputFromHeaders(input map[string]any, headers http.Header) {
+	if input == nil || headers == nil {
+		return
+	}
+	for key, values := range headers {
+		if len(values) == 0 {
+			continue
+		}
+		lower := strings.ToLower(strings.TrimSpace(key))
+		const prefix = "x-prompt-var-"
+		if !strings.HasPrefix(lower, prefix) {
+			continue
+		}
+		varName := strings.TrimSpace(strings.TrimPrefix(lower, prefix))
+		varName = strings.ReplaceAll(varName, "-", "_")
+		if varName == "" {
+			continue
+		}
+		if _, exists := input[varName]; exists {
+			continue
+		}
+		input[varName] = strings.TrimSpace(values[0])
+	}
+}
+
 func extractPromptSlug(path string) (string, bool) {
 	if !strings.HasPrefix(path, "/v1/prompt-apis/") {
 		return "", false
@@ -229,7 +270,7 @@ func extractPromptSlug(path string) (string, bool) {
 
 func writePromptAPIError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
-	case errors.Is(err, promptapi.ErrInvalidSlug), errors.Is(err, promptapi.ErrInvalidName), errors.Is(err, promptapi.ErrInvalidModel), errors.Is(err, promptapi.ErrInvalidTemplate), errors.Is(err, promptapi.ErrInvalidInput):
+	case errors.Is(err, promptapi.ErrInvalidSlug), errors.Is(err, promptapi.ErrInvalidName), errors.Is(err, promptapi.ErrInvalidModel), errors.Is(err, promptapi.ErrInvalidTemplate), errors.Is(err, promptapi.ErrInvalidInput), errors.Is(err, promptapi.ErrInvalidDefaultAPI), errors.Is(err, promptapi.ErrModelNotAllowed):
 		writeOpenAIError(w, r, http.StatusBadRequest, "invalid_prompt_api_request", "invalid_request_error", err.Error(), "prompt_api")
 	case errors.Is(err, promptapi.ErrNotFound):
 		writeOpenAIError(w, r, http.StatusNotFound, "prompt_api_not_found", "invalid_request_error", err.Error(), "prompt_api")

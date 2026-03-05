@@ -1,0 +1,77 @@
+{
+  "upstreams": [
+    {
+      "id": "ups_9b4289af33da56e5",
+      "name": "ollama",
+      "type": "ollama",
+      "base_url": "http://127.0.0.1/v1",
+      "models": [
+        "gpt-oss:20b",
+        "qwen3:8b"
+      ],
+      "enabled": true,
+      "last_health_status": "unhealthy",
+      "last_health_error": "Get \"http://127.0.0.1/v1/api/tags\": dial tcp 127.0.0.1:80: connect: connection refused",
+      "last_health_checked_at": "2026-03-05T02:32:24.738868Z",
+      "created_at": "2026-03-04T14:35:26.89522Z",
+      "updated_at": "2026-03-05T02:32:24.739489Z"
+    },
+    {
+      "id": "ups_b03ca496c30097b5",
+      "name": "bailian",
+      "type": "openai_compat",
+      "base_url": "https://coding.dashscope.aliyuncs.com/v1",
+      "api_key": "sk-sp-6e6ea4305d0748df8345a1ef00bb4984",
+      "models": [
+        "MiniMax-M2.5",
+        "glm-4.7",
+        "glm-5",
+        "kimi-k2.5",
+        "qwen3-coder-next",
+        "qwen3-coder-plus",
+        "qwen3-max-2026-01-23",
+        "qwen3.5-plus"
+      ],
+      "enabled": true,
+      "last_health_status": "healthy",
+      "last_health_latency_ms": 259,
+      "last_health_http_code": 404,
+      "last_health_endpoint": "https://coding.dashscope.aliyuncs.com/v1/models",
+      "last_health_checked_at": "2026-03-05T06:33:06.530471Z",
+      "created_at": "2026-03-05T02:31:12.392737Z",
+      "updated_at": "2026-03-05T06:33:06.790772Z"
+    }
+  ],
+  "routes": [
+    {
+      "alias": "本地优先",
+      "strategy": "fallback",
+      "enabled": true,
+      "targets": [
+        {
+          "upstream_id": "ups_9b4289af33da56e5",
+          "model": "qwen3:8b",
+          "weight": 100,
+          "priority": 1,
+          "enabled": true
+        },
+        {
+          "upstream_id": "ups_9b4289af33da56e5",
+          "model": "gpt-oss:20b",
+          "weight": 100,
+          "priority": 2,
+          "enabled": true
+        },
+        {
+          "upstream_id": "ups_b03ca496c30097b5",
+          "model": "kimi-k2.5",
+          "weight": 100,
+          "priority": 3,
+          "enabled": true
+        }
+      ],
+      "created_at": "2026-03-05T03:12:56.707991Z",
+      "updated_at": "2026-03-05T03:12:56.707991Z"
+    }
+  ]
+}

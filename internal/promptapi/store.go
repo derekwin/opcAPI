@@ -11,7 +11,8 @@ import (
 )
 
 type dataset struct {
-	Definitions []Definition `json:"definitions"`
+	Definitions []Definition       `json:"definitions"`
+	DefaultAPIs []DefaultAPIConfig `json:"default_apis,omitempty"`
 }
 
 type FileStore struct {
@@ -30,7 +31,7 @@ func NewFileStore(path string) (*FileStore, error) {
 	return s, nil
 }
 
-func (s *FileStore) Get(tenantID, slug string) (Definition, bool, error) {
+func (s *FileStore) Get(slug string) (Definition, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -39,7 +40,7 @@ func (s *FileStore) Get(tenantID, slug string) (Definition, bool, error) {
 		return Definition{}, false, err
 	}
 	for _, d := range ds.Definitions {
-		if d.TenantID == tenantID && d.Slug == slug {
+		if d.Slug == slug {
 			return d, true, nil
 		}
 	}
@@ -57,7 +58,7 @@ func (s *FileStore) Upsert(def Definition) (Definition, error) {
 
 	replaced := false
 	for i := range ds.Definitions {
-		if ds.Definitions[i].TenantID == def.TenantID && ds.Definitions[i].Slug == def.Slug {
+		if ds.Definitions[i].Slug == def.Slug {
 			ds.Definitions[i] = def
 			replaced = true
 			break
@@ -73,6 +74,33 @@ func (s *FileStore) Upsert(def Definition) (Definition, error) {
 	return def, nil
 }
 
+func (s *FileStore) Delete(slug string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ds, err := s.loadLocked()
+	if err != nil {
+		return err
+	}
+	slug = strings.TrimSpace(slug)
+	if slug == "" {
+		return ErrInvalidSlug
+	}
+
+	idx := -1
+	for i := range ds.Definitions {
+		if ds.Definitions[i].Slug == slug {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return ErrNotFound
+	}
+	ds.Definitions = append(ds.Definitions[:idx], ds.Definitions[idx+1:]...)
+	return s.saveLocked(ds)
+}
+
 func (s *FileStore) Query(q ListQuery) ([]Definition, int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -85,9 +113,6 @@ func (s *FileStore) Query(q ListQuery) ([]Definition, int, error) {
 	status := strings.ToLower(strings.TrimSpace(q.Status))
 	items := make([]Definition, 0)
 	for _, d := range ds.Definitions {
-		if d.TenantID != q.TenantID {
-			continue
-		}
 		if status != "" && strings.ToLower(d.Status) != status {
 			continue
 		}
@@ -122,6 +147,69 @@ func (s *FileStore) Query(q ListQuery) ([]Definition, int, error) {
 	return items[offset:end], total, nil
 }
 
+func (s *FileStore) GetDefaultAPI(apiKey string) (DefaultAPIConfig, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ds, err := s.loadLocked()
+	if err != nil {
+		return DefaultAPIConfig{}, false, err
+	}
+	key := strings.TrimSpace(apiKey)
+	if key == "" {
+		return DefaultAPIConfig{}, false, ErrInvalidDefaultAPI
+	}
+	for _, item := range ds.DefaultAPIs {
+		if item.APIKey == key {
+			return item, true, nil
+		}
+	}
+	return DefaultAPIConfig{}, false, nil
+}
+
+func (s *FileStore) UpsertDefaultAPI(cfg DefaultAPIConfig) (DefaultAPIConfig, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ds, err := s.loadLocked()
+	if err != nil {
+		return DefaultAPIConfig{}, err
+	}
+
+	replaced := false
+	for i := range ds.DefaultAPIs {
+		if ds.DefaultAPIs[i].APIKey == cfg.APIKey {
+			ds.DefaultAPIs[i] = cfg
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		ds.DefaultAPIs = append(ds.DefaultAPIs, cfg)
+	}
+
+	if err := s.saveLocked(ds); err != nil {
+		return DefaultAPIConfig{}, err
+	}
+	return cfg, nil
+}
+
+func (s *FileStore) ListDefaultAPIs() ([]DefaultAPIConfig, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ds, err := s.loadLocked()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]DefaultAPIConfig, len(ds.DefaultAPIs))
+	copy(out, ds.DefaultAPIs)
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].APIKey < out[j].APIKey
+	})
+	return out, nil
+}
+
 func (s *FileStore) ensureFile() error {
 	dir := filepath.Dir(s.path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -134,7 +222,7 @@ func (s *FileStore) ensureFile() error {
 		return err
 	}
 
-	empty := dataset{Definitions: []Definition{}}
+	empty := dataset{Definitions: []Definition{}, DefaultAPIs: []DefaultAPIConfig{}}
 	b, err := json.MarshalIndent(empty, "", "  ")
 	if err != nil {
 		return err
@@ -158,6 +246,9 @@ func (s *FileStore) loadLocked() (dataset, error) {
 	}
 	if ds.Definitions == nil {
 		ds.Definitions = []Definition{}
+	}
+	if ds.DefaultAPIs == nil {
+		ds.DefaultAPIs = []DefaultAPIConfig{}
 	}
 	return ds, nil
 }

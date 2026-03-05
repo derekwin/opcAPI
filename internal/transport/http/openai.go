@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/derekwin/opcAPI/internal/billing"
+	"github.com/derekwin/opcAPI/internal/promptapi"
 	"github.com/derekwin/opcAPI/internal/provider"
 )
 
@@ -82,6 +82,8 @@ type openAIError struct {
 	Code    string `json:"code,omitempty"`
 }
 
+const endUserDefaultModel = "app/default"
+
 func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
@@ -92,45 +94,56 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if strings.TrimSpace(req.Model) == "" {
-		writeOpenAIError(w, r, http.StatusBadRequest, "missing_model", "invalid_request_error", "model is required", "model")
-		return
-	}
 	if len(req.Messages) == 0 {
 		writeOpenAIError(w, r, http.StatusBadRequest, "missing_messages", "invalid_request_error", "messages is required", "messages")
 		return
 	}
 
-	apiKey := APIKeyFromContext(r.Context())
-	tenantID := ""
-	if h.policySync != nil {
-		tenantID = strings.TrimSpace(h.policySync.ResolveTenantByKeyHash(apiKey))
-	}
-	if h.requireTenantBoundKey {
-		if h.policySync == nil {
-			writeOpenAIError(w, r, http.StatusServiceUnavailable, "policy_sync_unavailable", "server_error", "policy sync unavailable", "service")
+	subject := quotaSubjectFromContext(r.Context())
+
+	if h.limiter != nil {
+		tokenDecision := h.limiter.AllowTokenUsage(subject)
+		if !tokenDecision.Allowed {
+			writeOpenAIError(w, r, http.StatusTooManyRequests, tokenDecision.Reason, "rate_limit_error", "token usage limit exceeded", "token_limit")
 			return
 		}
-		if tenantID == "" {
-			writeOpenAIError(w, r, http.StatusForbidden, "tenant_binding_required", "permission_error", "api key is not bound to tenant", "tenant_id")
-			return
+		if tokenDecision.FiveHourLimit > 0 {
+			w.Header().Set("X-TokenLimit-5H", fmt.Sprintf("%d", tokenDecision.FiveHourLimit))
+			w.Header().Set("X-TokenLimit-Remaining-5H", fmt.Sprintf("%d", tokenDecision.FiveHourRemaining))
+		}
+		if tokenDecision.MonthlyLimit > 0 {
+			w.Header().Set("X-TokenLimit-Monthly", fmt.Sprintf("%d", tokenDecision.MonthlyLimit))
+			w.Header().Set("X-TokenLimit-Remaining-Monthly", fmt.Sprintf("%d", tokenDecision.MonthlyRemaining))
 		}
 	}
 
-	if h.limiter != nil {
-		tokenDecision := h.limiter.AllowTokenUsage(apiKey)
-		if !tokenDecision.Allowed {
-			writeOpenAIError(w, r, http.StatusTooManyRequests, tokenDecision.Reason, "rate_limit_error", "daily token limit exceeded", "token_limit")
+	resolvedModel := strings.TrimSpace(req.Model)
+	if h.promptAPI != nil {
+		resolved, _, err := h.promptAPI.ResolveModelForAPI(r.Context(), promptapi.DefaultAPIChatCompletions, resolvedModel)
+		if err != nil {
+			switch {
+			case errors.Is(err, promptapi.ErrModelNotAllowed):
+				writeOpenAIError(w, r, http.StatusBadRequest, "invalid_model", "invalid_request_error", "model is not allowed for this api", "model")
+			case errors.Is(err, promptapi.ErrStoreUnavailable):
+				writeOpenAIError(w, r, http.StatusServiceUnavailable, "prompt_api_unavailable", "server_error", "prompt api service unavailable", "service")
+			default:
+				h.logger.Error("resolve default api model failed", "err", err, "request_id", RequestIDFromContext(r.Context()))
+				writeOpenAIError(w, r, http.StatusInternalServerError, "internal_error", "server_error", "internal server error", "")
+			}
 			return
 		}
-		if tokenDecision.Limit > 0 {
-			w.Header().Set("X-TokenLimit-Daily", fmt.Sprintf("%d", tokenDecision.Limit))
-			w.Header().Set("X-TokenLimit-Remaining-Daily", fmt.Sprintf("%d", tokenDecision.Remaining))
+		if strings.TrimSpace(resolved) != "" {
+			resolvedModel = strings.TrimSpace(resolved)
+		}
+	}
+	if resolvedModel == "" && h.upstream != nil {
+		if alias, ok, err := h.upstream.DefaultRouteAlias(); err == nil && ok {
+			resolvedModel = alias
 		}
 	}
 
 	providerReq := provider.ChatRequest{
-		Model:    req.Model,
+		Model:    resolvedModel,
 		Messages: toProviderMessages(req.Messages),
 	}
 	result, err := h.gateway.Chat(r.Context(), providerReq)
@@ -145,9 +158,9 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		reply = ""
 	}
 
-	resModel := result.Model
-	if strings.TrimSpace(resModel) == "" {
-		resModel = req.Model
+	resModel := endUserDefaultModel
+	if strings.TrimSpace(req.Model) != "" {
+		resModel = strings.TrimSpace(req.Model)
 	}
 
 	id := "chatcmpl-" + shortID()
@@ -158,12 +171,7 @@ func (h *handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		TotalTokens:      result.PromptTokens + result.CompletionTokens,
 	}
 	if h.limiter != nil && usageVal.TotalTokens > 0 {
-		h.limiter.AddTokenUsage(apiKey, usageVal.TotalTokens)
-	}
-
-	if err := h.applyUsageBilling(r, tenantID, usageVal); err != nil {
-		writeInferenceBillingError(w, r, err)
-		return
+		h.limiter.AddTokenUsage(subject, usageVal.TotalTokens)
 	}
 
 	if req.Stream {
@@ -247,25 +255,54 @@ func (h *handler) streamChatCompletion(w http.ResponseWriter, r *http.Request, i
 }
 
 func (h *handler) models(w http.ResponseWriter, r *http.Request) {
-	models := h.gateway.Models(r.Context())
-	if len(models) == 0 {
-		models = []provider.ModelInfo{{ID: "stub/opcapi-mvp", OwnedBy: "opcapi"}}
-	}
-
-	items := make([]map[string]any, 0, len(models))
 	now := time.Now().Unix()
-	for _, m := range models {
-		items = append(items, map[string]any{
-			"id":       m.ID,
+	data := make([]map[string]any, 0, 8)
+	overrideModelIDs := make([]string, 0, 8)
+	if h.promptAPI != nil {
+		if ids, err := h.promptAPI.ListModelIDsForAPI(r.Context(), promptapi.DefaultAPIChatCompletions); err == nil {
+			overrideModelIDs = ids
+		}
+	}
+	if len(overrideModelIDs) > 0 {
+		for _, id := range overrideModelIDs {
+			value := strings.TrimSpace(id)
+			if value == "" {
+				continue
+			}
+			data = append(data, map[string]any{
+				"id":       value,
+				"object":   "model",
+				"created":  now,
+				"owned_by": "opcapi",
+			})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"object": "list",
+			"data":   data,
+		})
+		return
+	}
+	if h.gateway != nil {
+		for _, item := range h.gateway.Models(r.Context()) {
+			data = append(data, map[string]any{
+				"id":       item.ID,
+				"object":   "model",
+				"created":  now,
+				"owned_by": item.OwnedBy,
+			})
+		}
+	}
+	if len(data) == 0 {
+		data = append(data, map[string]any{
+			"id":       endUserDefaultModel,
 			"object":   "model",
 			"created":  now,
-			"owned_by": m.OwnedBy,
+			"owned_by": "opcapi",
 		})
 	}
-
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
-		"data":   items,
+		"data":   data,
 	})
 }
 
@@ -336,35 +373,4 @@ func writeOpenAIError(w http.ResponseWriter, r *http.Request, status int, code, 
 			Code:    code,
 		},
 	})
-}
-
-func (h *handler) applyUsageBilling(r *http.Request, tenantID string, usageVal usage) error {
-	if h == nil || h.billing == nil || strings.TrimSpace(tenantID) == "" || usageVal.TotalTokens <= 0 {
-		return nil
-	}
-
-	_, _, err := h.billing.ChargeUsage(r.Context(), tenantID, usageVal.PromptTokens, usageVal.CompletionTokens)
-	if err != nil && h.logger != nil {
-		h.logger.Warn("billing usage charge failed",
-			"tenant_id", tenantID,
-			"prompt_tokens", usageVal.PromptTokens,
-			"completion_tokens", usageVal.CompletionTokens,
-			"err", err,
-			"request_id", RequestIDFromContext(r.Context()),
-		)
-	}
-	return err
-}
-
-func writeInferenceBillingError(w http.ResponseWriter, r *http.Request, err error) {
-	switch {
-	case errors.Is(err, billing.ErrInsufficientBalance):
-		writeOpenAIError(w, r, http.StatusPaymentRequired, "insufficient_balance", "billing_error", "insufficient balance", "balance")
-	case errors.Is(err, billing.ErrInvalidUsage), errors.Is(err, billing.ErrInvalidCurrency), errors.Is(err, billing.ErrInvalidAmount):
-		writeOpenAIError(w, r, http.StatusBadRequest, "invalid_billing_request", "invalid_request_error", err.Error(), "billing")
-	case errors.Is(err, billing.ErrStoreUnavailable):
-		writeOpenAIError(w, r, http.StatusServiceUnavailable, "billing_unavailable", "server_error", "billing service unavailable", "service")
-	default:
-		writeOpenAIError(w, r, http.StatusInternalServerError, "internal_error", "server_error", "internal server error", "")
-	}
 }

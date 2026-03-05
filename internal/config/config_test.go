@@ -13,7 +13,6 @@ func TestLoadDefaults(t *testing.T) {
 	t.Setenv("HTTP_SHUTDOWN_TIMEOUT", "")
 	t.Setenv("LOG_LEVEL", "")
 	t.Setenv("REQUIRE_API_KEY", "")
-	t.Setenv("REQUIRE_TENANT_BOUND_KEY", "")
 	t.Setenv("API_KEYS", "")
 	t.Setenv("REQUEST_RPM_LIMIT", "")
 	t.Setenv("DAILY_TOKEN_LIMIT", "")
@@ -32,13 +31,17 @@ func TestLoadDefaults(t *testing.T) {
 	t.Setenv("BILLING_STORE_PATH", "")
 	t.Setenv("PROMPT_API_STORE_PATH", "")
 	t.Setenv("AUDIT_STORE_PATH", "")
+	t.Setenv("UPSTREAM_STORE_PATH", "")
 	t.Setenv("SESSION_SECRET", "")
 	t.Setenv("SESSION_TTL", "")
-	t.Setenv("PHONE_TEST_CODE", "")
 	t.Setenv("PROVIDER_TIMEOUT", "")
 	t.Setenv("DEFAULT_PROVIDER", "")
 	t.Setenv("OPENAI_BASE_URL", "")
 	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("ANTHROPIC_BASE_URL", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("GEMINI_BASE_URL", "")
+	t.Setenv("GEMINI_API_KEY", "")
 	t.Setenv("OLLAMA_BASE_URL", "")
 
 	cfg := Load()
@@ -63,9 +66,6 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if !cfg.RequireAPIKey {
 		t.Fatalf("expected RequireAPIKey=true by default")
-	}
-	if !cfg.RequireTenantBoundKey {
-		t.Fatalf("expected RequireTenantBoundKey=true by default")
 	}
 	if cfg.APIKeys != "sk-opcapi-dev" {
 		t.Fatalf("unexpected API keys: %s", cfg.APIKeys)
@@ -118,20 +118,26 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.AuditStorePath != "data/audit_logs.json" {
 		t.Fatalf("unexpected audit store path: %s", cfg.AuditStorePath)
 	}
+	if cfg.UpstreamStorePath != "data/upstreams.json" {
+		t.Fatalf("unexpected upstream store path: %s", cfg.UpstreamStorePath)
+	}
 	if cfg.SessionSecret != "opcapi-dev-session-secret" {
 		t.Fatalf("unexpected session secret: %s", cfg.SessionSecret)
 	}
 	if cfg.SessionTTL != 168*time.Hour {
 		t.Fatalf("unexpected session ttl: %s", cfg.SessionTTL)
 	}
-	if cfg.PhoneTestCode != "000000" {
-		t.Fatalf("unexpected phone test code: %s", cfg.PhoneTestCode)
-	}
 	if cfg.DefaultProvider != "stub" {
 		t.Fatalf("unexpected default provider: %s", cfg.DefaultProvider)
 	}
 	if cfg.OpenAIBaseURL != "https://api.openai.com" {
 		t.Fatalf("unexpected openai base url: %s", cfg.OpenAIBaseURL)
+	}
+	if cfg.AnthropicBaseURL != "https://api.anthropic.com" {
+		t.Fatalf("unexpected anthropic base url: %s", cfg.AnthropicBaseURL)
+	}
+	if cfg.GeminiBaseURL != "https://generativelanguage.googleapis.com" {
+		t.Fatalf("unexpected gemini base url: %s", cfg.GeminiBaseURL)
 	}
 	if cfg.OllamaBaseURL != "http://localhost:11434" {
 		t.Fatalf("unexpected ollama base url: %s", cfg.OllamaBaseURL)
@@ -146,7 +152,6 @@ func TestLoadOverrides(t *testing.T) {
 	t.Setenv("HTTP_SHUTDOWN_TIMEOUT", "5")
 	t.Setenv("LOG_LEVEL", "debug")
 	t.Setenv("REQUIRE_API_KEY", "false")
-	t.Setenv("REQUIRE_TENANT_BOUND_KEY", "false")
 	t.Setenv("API_KEYS", "sk-1,sk-2")
 	t.Setenv("REQUEST_RPM_LIMIT", "240")
 	t.Setenv("DAILY_TOKEN_LIMIT", "3000000")
@@ -165,13 +170,17 @@ func TestLoadOverrides(t *testing.T) {
 	t.Setenv("BILLING_STORE_PATH", "data/test-billing.json")
 	t.Setenv("PROMPT_API_STORE_PATH", "data/test-prompt-apis.json")
 	t.Setenv("AUDIT_STORE_PATH", "data/test-audit.json")
+	t.Setenv("UPSTREAM_STORE_PATH", "data/test-upstreams.json")
 	t.Setenv("SESSION_SECRET", "test-session-secret")
 	t.Setenv("SESSION_TTL", "72h")
-	t.Setenv("PHONE_TEST_CODE", "123456")
 	t.Setenv("PROVIDER_TIMEOUT", "90")
 	t.Setenv("DEFAULT_PROVIDER", "openai")
 	t.Setenv("OPENAI_BASE_URL", "https://example.com/v1")
 	t.Setenv("OPENAI_API_KEY", "abc")
+	t.Setenv("ANTHROPIC_BASE_URL", "https://anthropic.example.com")
+	t.Setenv("ANTHROPIC_API_KEY", "anth-key")
+	t.Setenv("GEMINI_BASE_URL", "https://gemini.example.com")
+	t.Setenv("GEMINI_API_KEY", "gem-key")
 	t.Setenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 
 	cfg := Load()
@@ -199,9 +208,6 @@ func TestLoadOverrides(t *testing.T) {
 	}
 	if cfg.RequireAPIKey {
 		t.Fatalf("expected RequireAPIKey=false")
-	}
-	if cfg.RequireTenantBoundKey {
-		t.Fatalf("expected RequireTenantBoundKey=false")
 	}
 	if cfg.APIKeys != "sk-1,sk-2" {
 		t.Fatalf("unexpected API keys: %s", cfg.APIKeys)
@@ -257,20 +263,32 @@ func TestLoadOverrides(t *testing.T) {
 	if cfg.AuditStorePath != "data/test-audit.json" {
 		t.Fatalf("unexpected audit store path: %s", cfg.AuditStorePath)
 	}
+	if cfg.UpstreamStorePath != "data/test-upstreams.json" {
+		t.Fatalf("unexpected upstream store path: %s", cfg.UpstreamStorePath)
+	}
 	if cfg.SessionSecret != "test-session-secret" {
 		t.Fatalf("unexpected session secret: %s", cfg.SessionSecret)
 	}
 	if cfg.SessionTTL != 72*time.Hour {
 		t.Fatalf("unexpected session ttl: %s", cfg.SessionTTL)
 	}
-	if cfg.PhoneTestCode != "123456" {
-		t.Fatalf("unexpected phone test code: %s", cfg.PhoneTestCode)
-	}
 	if cfg.DefaultProvider != "openai" {
 		t.Fatalf("unexpected default provider: %s", cfg.DefaultProvider)
 	}
 	if cfg.OpenAIBaseURL != "https://example.com/v1" {
 		t.Fatalf("unexpected openai base url: %s", cfg.OpenAIBaseURL)
+	}
+	if cfg.AnthropicBaseURL != "https://anthropic.example.com" {
+		t.Fatalf("unexpected anthropic base url: %s", cfg.AnthropicBaseURL)
+	}
+	if cfg.AnthropicAPIKey != "anth-key" {
+		t.Fatalf("unexpected anthropic api key: %s", cfg.AnthropicAPIKey)
+	}
+	if cfg.GeminiBaseURL != "https://gemini.example.com" {
+		t.Fatalf("unexpected gemini base url: %s", cfg.GeminiBaseURL)
+	}
+	if cfg.GeminiAPIKey != "gem-key" {
+		t.Fatalf("unexpected gemini api key: %s", cfg.GeminiAPIKey)
 	}
 	if cfg.OpenAIAPIKey != "abc" {
 		t.Fatalf("unexpected openai api key: %s", cfg.OpenAIAPIKey)

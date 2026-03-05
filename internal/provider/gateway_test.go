@@ -36,6 +36,22 @@ func TestParseModel(t *testing.T) {
 			wantExplicit:    true,
 		},
 		{
+			name:            "explicit anthropic",
+			model:           "anthropic/claude-3-5-haiku-latest",
+			defaultProvider: "openai",
+			wantProvider:    "anthropic",
+			wantModel:       "claude-3-5-haiku-latest",
+			wantExplicit:    true,
+		},
+		{
+			name:            "explicit gemini",
+			model:           "gemini/gemini-2.0-flash",
+			defaultProvider: "openai",
+			wantProvider:    "gemini",
+			wantModel:       "gemini-2.0-flash",
+			wantExplicit:    true,
+		},
+		{
 			name:            "no prefix",
 			model:           "gpt-4o-mini",
 			defaultProvider: "openai",
@@ -128,8 +144,8 @@ func TestGatewayModels(t *testing.T) {
 	g := NewGateway(cfg, testLogger())
 
 	models := g.Models(context.Background())
-	if len(models) < 3 {
-		t.Fatalf("expected at least 3 models, got %d", len(models))
+	if len(models) != 1 || models[0].ID != "stub/opcapi-mvp" {
+		t.Fatalf("expected stub fallback model only, got %+v", models)
 	}
 }
 

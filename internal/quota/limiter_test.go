@@ -87,3 +87,37 @@ func TestPerKeyPolicyOverridesDefault(t *testing.T) {
 		t.Fatalf("token usage should be denied by per-key daily limit")
 	}
 }
+
+func TestFiveHourAndMonthlyTokenLimits(t *testing.T) {
+	base := time.Date(2026, 3, 1, 10, 0, 0, 0, time.UTC)
+	current := base
+	l := NewLimiter(0, 0)
+	l.nowFn = func() time.Time { return current }
+	l.SetKeyPolicies(map[string]KeyPolicy{
+		"k-member": {FiveHourTokenLimit: 20, MonthlyTokenLimit: 30},
+	})
+
+	if !l.AllowTokenUsage("k-member").Allowed {
+		t.Fatalf("initial token usage should be allowed")
+	}
+	l.AddTokenUsage("k-member", 20)
+	d := l.AllowTokenUsage("k-member")
+	if d.Allowed || d.Reason != "five_hour_token_limit_exceeded" {
+		t.Fatalf("expected five-hour limit exceeded, got %+v", d)
+	}
+
+	current = base.Add(5*time.Hour + time.Minute)
+	if !l.AllowTokenUsage("k-member").Allowed {
+		t.Fatalf("five-hour window should reset")
+	}
+	l.AddTokenUsage("k-member", 11)
+	d = l.AllowTokenUsage("k-member")
+	if d.Allowed || d.Reason != "monthly_token_limit_exceeded" {
+		t.Fatalf("expected monthly limit exceeded, got %+v", d)
+	}
+
+	current = time.Date(2026, 4, 1, 1, 0, 0, 0, time.UTC)
+	if !l.AllowTokenUsage("k-member").Allowed {
+		t.Fatalf("monthly window should reset")
+	}
+}

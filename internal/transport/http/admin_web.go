@@ -1,673 +1,438 @@
 package http
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"net/http"
 	"net/url"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/derekwin/opcAPI/internal/audit"
 	"github.com/derekwin/opcAPI/internal/billing"
-	"github.com/derekwin/opcAPI/internal/keymgmt"
 	"github.com/derekwin/opcAPI/internal/promptapi"
+	"github.com/derekwin/opcAPI/internal/provider"
+	"github.com/derekwin/opcAPI/internal/upstream"
 	"github.com/derekwin/opcAPI/internal/user"
 )
 
 const adminSessionCookieName = "opc_admin_session"
 
 type adminLoginView struct {
-	Lang             string
-	Message          string
-	Error            string
-	Channel          string
-	Identifier       string
-	VerificationCode string
-	TenantName       string
+	Lang  string
+	Error string
+}
+
+type adminSetupView struct {
+	Lang  string
+	Error string
 }
 
 type adminDashboardView struct {
-	Lang       string
-	Message    string
-	Error      string
-	Issues     []string
 	Claims     user.SessionClaims
 	Me         user.AuthResult
 	Users      []user.TenantUser
-	Keys       []keymgmt.PolicyRecord
 	PromptAPIs []promptapi.Definition
-	Balance    billing.Balance
 	Orders     []billing.Order
-	Audits     []audit.Event
+	Message    string
+	Error      string
 }
 
-var adminLoginTemplate = template.Must(template.New("admin-login").Funcs(template.FuncMap{
-	"ui":   adminUI,
-	"enum": adminEnum,
-}).Parse(`<!doctype html>
-<html lang="{{.Lang}}">
+var adminAuthTemplateFuncs = template.FuncMap{
+	"ui": adminUI,
+	"uiOr": func(lang, key, fallback string) string {
+		v := adminUI(lang, key)
+		if v == key {
+			return fallback
+		}
+		return v
+	},
+	"langCode": func(lang string) string {
+		if isChineseLang(lang) {
+			return languageZhCN
+		}
+		return languageEN
+	},
+	"withLang": withLangPath,
+}
+var adminLoginTemplate = template.Must(template.New("admin-login").Funcs(adminAuthTemplateFuncs).Parse(`<!doctype html>
+<html lang="{{langCode .Lang}}">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{{ui $.Lang "login_title"}}</title>
+  <title>opcAPI Admin Login</title>
   <style>
     :root {
-      --bg: #f3f8ff;
+      --bg: #eef6f1;
       --panel: #ffffff;
-      --line: #d8e4f4;
-      --ink: #17283f;
-      --muted: #5d6f86;
-      --primary: #0f5cc0;
-      --danger: #b52929;
+      --ink: #162229;
+      --muted: #60717a;
+      --line: #d7e3dc;
+      --brand: #1e7a63;
+      --brand-strong: #185f4d;
+      --danger: #b24444;
+      --shadow: 0 20px 44px rgba(20, 39, 33, 0.12);
     }
+    * { box-sizing: border-box; }
     body {
       margin: 0;
-      padding: 24px;
-      font-family: "Avenir Next", "Segoe UI", sans-serif;
-      background: radial-gradient(circle at top right, #d9ecff 0, #f3f8ff 42%, #eef5ff 100%);
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      font-family: "IBM Plex Sans", "Noto Sans SC", "PingFang SC", "Segoe UI", sans-serif;
       color: var(--ink);
+      background:
+        radial-gradient(860px 430px at 0% 0%, #d5e9e0 0%, transparent 72%),
+        radial-gradient(760px 360px at 100% 100%, #dceee5 0%, transparent 70%),
+        var(--bg);
+      padding: 20px;
     }
-    .shell {
-      max-width: 620px;
-      margin: 24px auto;
-      padding: 28px;
-      border: 1px solid var(--line);
-      border-radius: 16px;
+    .card {
+      width: min(560px, 100%);
       background: var(--panel);
-      box-shadow: 0 14px 32px rgba(8, 29, 61, 0.08);
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      padding: 28px;
+      box-shadow: var(--shadow);
+      animation: rise .24s ease-out;
+      display: grid;
+      gap: 14px;
     }
-    h1 {
-      margin: 0 0 8px;
-      font-size: 28px;
-    }
-    p {
-      margin: 0 0 20px;
+    .eyebrow {
+      margin: 0;
+      letter-spacing: .11em;
+      font-weight: 600;
+      font-size: 11px;
       color: var(--muted);
     }
-    .msg {
-      margin-bottom: 14px;
+    h1 { margin: 0; font-size: 32px; letter-spacing: -.01em; }
+    p.sub { margin: 0; color: var(--muted); }
+    label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 12px; }
+    input {
+      width: 100%; margin-top: 7px; border: 1px solid var(--line); border-radius: 11px;
+      padding: 11px 12px; font-size: 14px; color: var(--ink); background: #fff;
+    }
+    .err {
+      margin: 0;
+      color: var(--danger);
+      border: 1px solid #efcccc;
+      background: #fff4f4;
       border-radius: 10px;
       padding: 10px 12px;
-      font-size: 14px;
+      font-size: 13px;
     }
-    .msg.ok {
-      border: 1px solid #a8d4af;
-      background: #effaf0;
-      color: #265f2d;
-    }
-    .msg.err {
-      border: 1px solid #edc0c0;
-      background: #fff1f1;
-      color: var(--danger);
-    }
-    form {
-      display: grid;
-      gap: 12px;
-    }
-    label {
-      font-size: 14px;
-      color: var(--muted);
-    }
-    input, select {
-      width: 100%;
-      box-sizing: border-box;
-      margin-top: 6px;
-      padding: 9px 10px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      font-size: 14px;
-      color: var(--ink);
-      background: #fff;
-    }
-    .actions {
-      display: flex;
-      gap: 10px;
-      margin-top: 6px;
-    }
+    .actions { display: flex; gap: 10px; margin-top: 8px; }
     button {
-      border: none;
-      border-radius: 8px;
-      padding: 10px 14px;
-      font-size: 14px;
-      cursor: pointer;
+      border: none; border-radius: 10px; padding: 10px 14px; cursor: pointer; font-size: 14px; transition: .16s ease-in-out;
     }
-    .primary {
-      background: var(--primary);
-      color: #fff;
+    .primary { background: var(--brand); color: #fff; }
+    .primary:hover { background: var(--brand-strong); transform: translateY(-1px); }
+    .secondary { background: #e8f2ed; color: var(--ink); }
+    .secondary:hover { transform: translateY(-1px); }
+    .tip { margin: 0; font-size: 12px; color: var(--muted); }
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
     }
-    .secondary {
-      background: #edf3fb;
-      color: var(--ink);
+    @media (max-width: 640px) {
+      .card { padding: 20px; border-radius: 14px; }
+      .actions { flex-direction: column; }
     }
   </style>
 </head>
 <body>
-  <main class="shell">
-    <h1>{{ui $.Lang "login_heading"}}</h1>
-    <p>{{ui $.Lang "login_subtitle"}}</p>
-    {{if .Message}}<div class="msg ok">{{.Message}}</div>{{end}}
-    {{if .Error}}<div class="msg err">{{.Error}}</div>{{end}}
-
-    <form method="post" action="/admin/login">
-      <label>{{ui $.Lang "channel"}}
-        <select name="channel">
-          <option value="phone" {{if eq .Channel "phone"}}selected{{end}}>{{enum $.Lang "channel" "phone"}}</option>
-          <option value="wechat" {{if eq .Channel "wechat"}}selected{{end}}>{{enum $.Lang "channel" "wechat"}}</option>
-          <option value="feishu" {{if eq .Channel "feishu"}}selected{{end}}>{{enum $.Lang "channel" "feishu"}}</option>
-        </select>
+  <main class="card">
+    <p class="eyebrow">{{uiOr .Lang "management" "OPCAPI MANAGEMENT"}}</p>
+    <h1>{{ui .Lang "sign_in"}}</h1>
+    <p class="sub">{{uiOr .Lang "admin_signin_subtitle" "Use your administrator account to enter the management console."}}</p>
+    {{if .Error}}<p class="err">{{.Error}}</p>{{end}}
+    <form method="post" action="{{withLang "/admin/login" .Lang}}">
+      <label>{{ui .Lang "email"}}
+        <input type="email" name="email" placeholder="admin@example.com" required />
       </label>
-      <label>{{ui $.Lang "identifier"}}
-        <input name="identifier" placeholder="{{ui $.Lang "placeholder_phone_openid"}}" value="{{.Identifier}}" required />
+      <label>{{ui .Lang "password"}}
+        <input type="password" name="password" placeholder="at least 8 characters" required />
       </label>
-      <label>{{ui $.Lang "verification_code_phone"}}
-        <input name="verification_code" placeholder="000000" value="{{.VerificationCode}}" />
-      </label>
-      <label>{{ui $.Lang "tenant_name_signup"}}
-        <input name="tenant_name" placeholder="demo" value="{{.TenantName}}" />
-      </label>
+      <p class="tip">{{uiOr .Lang "signin_tip" "If this is your first time, initialize admin from setup flow."}}</p>
       <div class="actions">
-        <button class="primary" type="submit" name="action" value="signin">{{ui $.Lang "sign_in"}}</button>
-        <button class="secondary" type="submit" name="action" value="signup">{{ui $.Lang "sign_up"}}</button>
+        <button class="primary" type="submit">{{ui .Lang "sign_in"}}</button>
+        <button class="secondary" type="button" onclick="location.href='/healthz'">Healthz</button>
       </div>
     </form>
   </main>
 </body>
-</html>
-`))
+</html>`))
 
-var adminDashboardTemplate = template.Must(template.New("admin-dashboard").Funcs(template.FuncMap{
-	"ui":   adminUI,
-	"enum": adminEnum,
-	"fmtTime": func(t time.Time) string {
-		if t.IsZero() {
-			return "-"
-		}
-		return t.Local().Format("2006-01-02 15:04:05")
-	},
-	"fmtMoney": func(v float64) string {
-		return fmt.Sprintf("%.2f", v)
-	},
-	"join": func(items []string) string {
-		return strings.Join(items, ",")
-	},
-	"short": func(v string) string {
-		if len(v) <= 16 {
-			return v
-		}
-		return v[:16] + "..."
-	},
-	"metaText": func(m map[string]string) string {
-		if len(m) == 0 {
-			return "-"
-		}
-		keys := make([]string, 0, len(m))
-		for k := range m {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		parts := make([]string, 0, len(keys))
-		for _, k := range keys {
-			parts = append(parts, k+"="+m[k])
-		}
-		return strings.Join(parts, "; ")
-	},
-}).Parse(`<!doctype html>
-<html lang="{{.Lang}}">
+var adminSetupTemplate = template.Must(template.New("admin-setup").Funcs(adminAuthTemplateFuncs).Parse(`<!doctype html>
+<html lang="{{langCode .Lang}}">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{{ui $.Lang "console_title"}}</title>
+  <title>opcAPI First Admin Setup</title>
   <style>
     :root {
-      --bg: #eef4fb;
+      --bg: #eef6f1;
       --panel: #ffffff;
-      --ink: #16273d;
-      --muted: #5f6f83;
-      --line: #d4dfef;
-      --brand: #0f5cc0;
-      --danger: #ab2a2a;
-      --ok: #247649;
+      --ink: #162229;
+      --muted: #60717a;
+      --line: #d7e3dc;
+      --brand: #1e7a63;
+      --brand-strong: #185f4d;
+      --danger: #b24444;
+      --shadow: 0 20px 44px rgba(20, 39, 33, 0.12);
     }
+    * { box-sizing: border-box; }
     body {
       margin: 0;
-      padding: 22px;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      font-family: "IBM Plex Sans", "Noto Sans SC", "PingFang SC", "Segoe UI", sans-serif;
       color: var(--ink);
-      font-family: "Avenir Next", "Segoe UI", sans-serif;
       background:
-        radial-gradient(circle at 0 0, rgba(187, 223, 255, 0.7), transparent 46%),
-        radial-gradient(circle at 100% 0, rgba(221, 236, 255, 0.9), transparent 40%),
+        radial-gradient(860px 430px at 0% 0%, #d5e9e0 0%, transparent 72%),
+        radial-gradient(760px 360px at 100% 100%, #dceee5 0%, transparent 70%),
         var(--bg);
-    }
-    .wrap {
-      max-width: 1200px;
-      margin: 0 auto;
-      display: grid;
-      gap: 16px;
-    }
-    .top {
-      display: flex;
-      gap: 12px;
-      align-items: center;
-      justify-content: space-between;
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      padding: 16px 18px;
-      box-shadow: 0 10px 24px rgba(9, 30, 57, 0.08);
-    }
-    .top h1 {
-      margin: 0;
-      font-size: 24px;
-    }
-    .meta {
-      color: var(--muted);
-      font-size: 13px;
-      margin-top: 6px;
-    }
-    .logout button {
-      border: none;
-      border-radius: 8px;
-      padding: 8px 12px;
-      cursor: pointer;
-      background: #e8eef8;
-      color: var(--ink);
-    }
-    .msg {
-      border-radius: 10px;
-      padding: 10px 12px;
-      font-size: 14px;
-    }
-    .msg.ok {
-      border: 1px solid #b8e0be;
-      color: var(--ok);
-      background: #edf8ef;
-    }
-    .msg.err {
-      border: 1px solid #efc2c2;
-      color: var(--danger);
-      background: #fff0f0;
-    }
-    .issues {
-      margin: 0;
-      padding: 0 0 0 18px;
-      color: var(--danger);
-    }
-    .grid {
-      display: grid;
-      gap: 16px;
-      grid-template-columns: repeat(12, minmax(0, 1fr));
+      padding: 20px;
     }
     .card {
+      width: min(560px, 100%);
       background: var(--panel);
       border: 1px solid var(--line);
-      border-radius: 14px;
-      box-shadow: 0 8px 20px rgba(9, 30, 57, 0.07);
-      padding: 14px;
-      overflow: auto;
+      border-radius: 20px;
+      padding: 28px;
+      box-shadow: var(--shadow);
+      animation: rise .24s ease-out;
+      display: grid;
+      gap: 14px;
+    }
+    .eyebrow {
+      margin: 0;
+      letter-spacing: .11em;
+      font-weight: 600;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    h1 { margin: 0; font-size: 32px; letter-spacing: -.01em; }
+    p.sub { margin: 0; color: var(--muted); }
+    label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 12px; }
+    input {
+      width: 100%; margin-top: 7px; border: 1px solid var(--line); border-radius: 11px;
+      padding: 11px 12px; font-size: 14px; color: var(--ink); background: #fff;
+    }
+    .err {
+      margin: 0;
+      color: var(--danger);
+      border: 1px solid #efcccc;
+      background: #fff4f4;
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 13px;
+    }
+    .actions { display: flex; gap: 10px; margin-top: 8px; }
+    button {
+      border: none; border-radius: 10px; padding: 10px 14px; cursor: pointer; font-size: 14px; transition: .16s ease-in-out;
+    }
+    .primary { background: var(--brand); color: #fff; }
+    .primary:hover { background: var(--brand-strong); transform: translateY(-1px); }
+    .secondary { background: #e8f2ed; color: var(--ink); }
+    .secondary:hover { transform: translateY(-1px); }
+    .tip { margin: 0; font-size: 12px; color: var(--muted); }
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    @media (max-width: 640px) {
+      .card { padding: 20px; border-radius: 14px; }
+      .actions { flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <p class="eyebrow">{{uiOr .Lang "bootstrap" "OPCAPI BOOTSTRAP"}}</p>
+    <h1>{{uiOr .Lang "initialize_admin" "Initialize Admin"}}</h1>
+    <p class="sub">{{uiOr .Lang "admin_setup_subtitle" "Create the first admin account. This page appears only when no admin exists."}}</p>
+    {{if .Error}}<p class="err">{{.Error}}</p>{{end}}
+    <form method="post" action="{{withLang "/admin/setup" .Lang}}">
+      <label>{{ui .Lang "email"}}
+        <input type="email" name="email" placeholder="admin@example.com" required />
+      </label>
+      <label>{{ui .Lang "password"}}
+        <input type="password" name="password" placeholder="at least 8 characters" required />
+      </label>
+      <label>{{ui .Lang "confirm_password"}}
+        <input type="password" name="password_confirm" placeholder="repeat password" required />
+      </label>
+      <p class="tip">{{uiOr .Lang "admin_setup_tip" "Use a production-grade password and store it securely."}}</p>
+      <div class="actions">
+        <button class="primary" type="submit">{{uiOr .Lang "create_super_admin" "Create Super Admin"}}</button>
+        <button class="secondary" type="button" onclick="location.href='/healthz'">Healthz</button>
+      </div>
+    </form>
+  </main>
+</body>
+</html>`))
+
+var adminDashboardTemplate = template.Must(template.New("admin-dashboard").Funcs(template.FuncMap{
+	"join": func(items []string) string { return strings.Join(items, ",") },
+}).Parse(`<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>opcAPI Admin Console</title>
+  <style>
+    :root {
+      --bg: #edf3fb;
+      --panel: #ffffff;
+      --ink: #112236;
+      --muted: #607089;
+      --line: #d8e3f2;
+      --brand: #1769e0;
+      --danger: #b42323;
+      --ok: #1f7a3a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 18px;
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      color: var(--ink);
+      background: radial-gradient(circle at top right, #d8e8fd, transparent 35%), var(--bg);
+    }
+    .wrap { max-width: 1280px; margin: 0 auto; display: grid; gap: 14px; }
+    .top {
+      display: flex; justify-content: space-between; align-items: center; gap: 12px;
+      background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+      padding: 14px 16px; box-shadow: 0 8px 24px rgba(17,39,70,.08);
+    }
+    h1 { margin: 0; font-size: 24px; }
+    .meta { color: var(--muted); font-size: 13px; margin-top: 4px; }
+    .msg { margin: 0; padding: 10px 12px; border-radius: 10px; }
+    .msg.ok { color: var(--ok); background: #edf8f1; border: 1px solid #b6dfc2; }
+    .msg.err { color: var(--danger); background: #fff1f1; border: 1px solid #efc6c6; }
+    .grid { display: grid; grid-template-columns: repeat(12,minmax(0,1fr)); gap: 14px; }
+    .card {
+      background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+      padding: 14px; box-shadow: 0 8px 20px rgba(17,39,70,.06); overflow: auto;
     }
     .col-12 { grid-column: span 12; }
-    .col-8 { grid-column: span 8; }
     .col-6 { grid-column: span 6; }
     .col-4 { grid-column: span 4; }
     .col-3 { grid-column: span 3; }
-    h2 {
-      margin: 0 0 12px;
-      font-size: 18px;
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 13px;
-    }
-    th, td {
-      border-bottom: 1px solid var(--line);
-      text-align: left;
-      padding: 8px 6px;
-      vertical-align: top;
-    }
-    th {
-      color: var(--muted);
-      font-weight: 600;
-      white-space: nowrap;
-    }
-    tr:last-child td {
-      border-bottom: none;
-    }
-    form.inline {
-      display: inline;
-    }
-    form.stack {
-      display: grid;
-      gap: 8px;
-    }
-    .fields-2 {
-      display: grid;
-      gap: 8px;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-    .fields-3 {
-      display: grid;
-      gap: 8px;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-    }
-    label {
-      font-size: 12px;
-      color: var(--muted);
-      display: grid;
-      gap: 5px;
-    }
+    h2 { margin: 0 0 10px; font-size: 18px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { border-bottom: 1px solid var(--line); text-align: left; padding: 8px 6px; vertical-align: top; }
+    tr:last-child td { border-bottom: none; }
+    th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+    form.stack { display: grid; gap: 8px; }
+    .f2 { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 8px; }
+    .f3 { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 8px; }
+    label { font-size: 12px; color: var(--muted); display: grid; gap: 4px; }
     input, textarea, select {
-      box-sizing: border-box;
-      width: 100%;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 8px 10px;
-      font-size: 13px;
-      color: var(--ink);
-      background: #fff;
+      width: 100%; border: 1px solid var(--line); border-radius: 8px;
+      padding: 8px 10px; font-size: 13px; background: #fff; color: var(--ink);
     }
-    textarea { min-height: 80px; resize: vertical; }
-    .btn {
-      width: fit-content;
-      border: none;
-      border-radius: 8px;
-      padding: 8px 12px;
-      cursor: pointer;
-      background: var(--brand);
-      color: #fff;
-      font-size: 13px;
-    }
-    .btn.danger {
-      background: var(--danger);
-    }
-    .mono {
-      font-family: Menlo, Consolas, monospace;
-      font-size: 12px;
-    }
-    @media (max-width: 950px) {
-      .col-8, .col-6, .col-4, .col-3 { grid-column: span 12; }
-    }
+    textarea { min-height: 90px; resize: vertical; }
+    .btn { width: fit-content; border: none; border-radius: 8px; padding: 8px 12px; cursor: pointer; color: #fff; background: var(--brand); }
+    .btn.gray { background: #6f8098; }
+    @media (max-width: 980px) { .col-6,.col-4,.col-3 { grid-column: span 12; } }
   </style>
 </head>
 <body>
   <main class="wrap">
     <section class="top">
       <div>
-        <h1>{{ui $.Lang "console_title"}}</h1>
-        <div class="meta">{{ui $.Lang "tenant"}}={{.Claims.TenantID}} {{ui $.Lang "user"}}={{.Claims.UserID}} {{ui $.Lang "role"}}={{enum $.Lang "role" .Claims.Role}}</div>
+        <h1>opcAPI Admin Console</h1>
+        <div class="meta">user={{.Claims.UserID}} role={{.Claims.Role}} email={{.Me.User.Email}}</div>
       </div>
-      <form class="logout" method="post" action="/admin/logout">
-        <button type="submit">{{ui $.Lang "sign_out"}}</button>
-      </form>
+      <form method="post" action="/admin/logout"><button class="btn gray" type="submit">Logout</button></form>
     </section>
 
-    {{if .Message}}<div class="msg ok">{{.Message}}</div>{{end}}
-    {{if .Error}}<div class="msg err">{{.Error}}</div>{{end}}
-    {{if .Issues}}
-      <div class="msg err">
-        <strong>{{ui $.Lang "partial_data_errors"}}</strong>
-        <ul class="issues">
-          {{range .Issues}}<li>{{.}}</li>{{end}}
-        </ul>
-      </div>
-    {{end}}
+    {{if .Message}}<p class="msg ok">{{.Message}}</p>{{end}}
+    {{if .Error}}<p class="msg err">{{.Error}}</p>{{end}}
 
     <section class="grid">
-      <article class="card col-3">
-        <h2>{{ui $.Lang "tenant"}}</h2>
-        <table>
-          <tr><th>{{ui $.Lang "id"}}</th><td class="mono">{{.Me.Tenant.ID}}</td></tr>
-          <tr><th>{{ui $.Lang "name"}}</th><td>{{.Me.Tenant.Name}}</td></tr>
-          <tr><th>{{ui $.Lang "plan"}}</th><td>{{.Me.Tenant.PlanID}}</td></tr>
-          <tr><th>{{ui $.Lang "status"}}</th><td>{{.Me.Tenant.Status}}</td></tr>
-          <tr><th>{{ui $.Lang "created"}}</th><td>{{fmtTime .Me.Tenant.CreatedAt}}</td></tr>
-        </table>
-      </article>
-
-      <article class="card col-3">
-        <h2>{{ui $.Lang "current_user"}}</h2>
-        <table>
-          <tr><th>{{ui $.Lang "id"}}</th><td class="mono">{{.Me.User.ID}}</td></tr>
-          <tr><th>{{ui $.Lang "phone"}}</th><td>{{.Me.User.Phone}}</td></tr>
-          <tr><th>{{ui $.Lang "wechat"}}</th><td>{{.Me.User.WeChatOpenID}}</td></tr>
-          <tr><th>{{ui $.Lang "feishu"}}</th><td>{{.Me.User.FeishuOpenID}}</td></tr>
-          <tr><th>{{ui $.Lang "status"}}</th><td>{{.Me.User.Status}}</td></tr>
-        </table>
-      </article>
-
-      <article class="card col-3">
-        <h2>{{ui $.Lang "balance"}}</h2>
-        <p><strong>{{fmtMoney .Balance.Amount}} {{.Balance.Currency}}</strong></p>
-        <p class="meta">{{ui $.Lang "updated"}}: {{fmtTime .Balance.UpdatedAt}}</p>
-        <form class="stack" method="post" action="/admin/billing/topup">
-          <div class="fields-3">
-            <label>{{ui $.Lang "amount"}}<input name="amount" value="100" required /></label>
-            <label>{{ui $.Lang "currency"}}<input name="currency" value="CNY" required /></label>
-            <label>{{ui $.Lang "channel"}}<input name="channel" value="manual" required /></label>
-          </div>
-          <label>{{ui $.Lang "description"}}<input name="description" placeholder="{{ui $.Lang "placeholder_manual_topup"}}" /></label>
-          <button class="btn" type="submit">{{ui $.Lang "top_up"}}</button>
-        </form>
-      </article>
-
-      <article class="card col-3">
-        <h2>{{ui $.Lang "quick_stats"}}</h2>
-        <table>
-          <tr><th>{{ui $.Lang "users"}}</th><td>{{len .Users}}</td></tr>
-          <tr><th>{{ui $.Lang "api_keys"}}</th><td>{{len .Keys}}</td></tr>
-          <tr><th>{{ui $.Lang "prompt_apis"}}</th><td>{{len .PromptAPIs}}</td></tr>
-          <tr><th>{{ui $.Lang "recent_orders"}}</th><td>{{len .Orders}}</td></tr>
-          <tr><th>{{ui $.Lang "audit_logs"}}</th><td>{{len .Audits}}</td></tr>
-        </table>
-      </article>
-
       <article class="card col-6">
-        <h2>{{ui $.Lang "api_keys"}}</h2>
-        <form class="stack" method="post" action="/admin/keys/new">
-          <div class="fields-3">
-            <label>{{ui $.Lang "api_key"}}<input name="api_key" placeholder="sk-opcapi-..." required /></label>
-            <label>{{ui $.Lang "rpm_limit"}}<input name="rpm_limit" value="120" /></label>
-            <label>{{ui $.Lang "daily_token_limit"}}<input name="daily_token_limit" value="1000000" /></label>
-          </div>
-          <label><input type="checkbox" name="enabled" checked /> {{ui $.Lang "enabled"}}</label>
-          <button class="btn" type="submit">{{ui $.Lang "save_api_key_policy"}}</button>
-        </form>
+        <h2>Users</h2>
         <table>
-          <thead>
-            <tr>
-              <th>{{ui $.Lang "key_hash"}}</th>
-              <th>{{ui $.Lang "tenant"}}</th>
-              <th>{{ui $.Lang "enabled"}}</th>
-              <th>{{ui $.Lang "rpm"}}</th>
-              <th>{{ui $.Lang "daily"}}</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {{range .Keys}}
-              <tr>
-                <td class="mono" title="{{.KeyHash}}">{{short .KeyHash}}</td>
-                <td class="mono">{{.TenantID}}</td>
-                <td>{{.Enabled}}</td>
-                <td>{{.RPMLimit}}</td>
-                <td>{{.DailyTokenLimit}}</td>
-                <td>
-                  <form class="inline" method="post" action="/admin/keys/delete">
-                    <input type="hidden" name="key_hash" value="{{.KeyHash}}" />
-                    <button class="btn danger" type="submit">{{ui $.Lang "delete"}}</button>
-                  </form>
-                </td>
-              </tr>
-            {{end}}
-          </tbody>
-        </table>
-      </article>
-
-      <article class="card col-6">
-        <h2>{{ui $.Lang "prompt_apis"}}</h2>
-        <form class="stack" method="post" action="/admin/prompt-apis/new">
-          <div class="fields-3">
-            <label>{{ui $.Lang "slug"}}<input name="slug" placeholder="{{ui $.Lang "placeholder_email_summary"}}" required /></label>
-            <label>{{ui $.Lang "name"}}<input name="name" placeholder="{{ui $.Lang "placeholder_email_summary_name"}}" required /></label>
-            <label>{{ui $.Lang "model"}}<input name="model" value="stub/test" required /></label>
-          </div>
-          <label>{{ui $.Lang "description"}}<input name="description" /></label>
-          <label>{{ui $.Lang "system_prompt"}}<textarea name="system_prompt"></textarea></label>
-          <label>{{ui $.Lang "user_template"}}<textarea name="user_template" required>{{ui $.Lang "default_user_template"}}</textarea></label>
-          <label>{{ui $.Lang "variables_comma"}}<input name="variables" value="content" /></label>
-          <label><input type="checkbox" name="publish" checked /> {{ui $.Lang "publish"}}</label>
-          <button class="btn" type="submit">{{ui $.Lang "save_prompt_api"}}</button>
-        </form>
-        <table>
-          <thead>
-            <tr>
-              <th>{{ui $.Lang "slug"}}</th>
-              <th>{{ui $.Lang "status"}}</th>
-              <th>{{ui $.Lang "version"}}</th>
-              <th>{{ui $.Lang "model"}}</th>
-              <th>{{ui $.Lang "variables"}}</th>
-              <th>{{ui $.Lang "updated"}}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {{range .PromptAPIs}}
-              <tr>
-                <td class="mono">{{.Slug}}</td>
-                <td>{{enum $.Lang "status" .Status}}</td>
-                <td>{{.Version}}</td>
-                <td class="mono">{{.Model}}</td>
-                <td class="mono">{{join .Variables}}</td>
-                <td>{{fmtTime .UpdatedAt}}</td>
-              </tr>
-            {{end}}
-          </tbody>
-        </table>
-      </article>
-
-      <article class="card col-4">
-        <h2>{{ui $.Lang "users"}}</h2>
-        {{if eq .Claims.Role "owner"}}
-        <form class="stack" method="post" action="/admin/users/new">
-          <div class="fields-2">
-            <label>{{ui $.Lang "channel"}}
-              <select name="channel">
-                <option value="phone">{{enum $.Lang "channel" "phone"}}</option>
-                <option value="wechat">{{enum $.Lang "channel" "wechat"}}</option>
-                <option value="feishu">{{enum $.Lang "channel" "feishu"}}</option>
-              </select>
-            </label>
-            <label>{{ui $.Lang "role"}}
-              <select name="role">
-                <option value="admin">{{enum $.Lang "role" "admin"}}</option>
-                <option value="member">{{enum $.Lang "role" "member"}}</option>
-              </select>
-            </label>
-          </div>
-          <label>{{ui $.Lang "identifier"}}<input name="identifier" placeholder="{{ui $.Lang "placeholder_phone_openid"}}" required /></label>
-          <label>{{ui $.Lang "verification_code_phone_only"}}<input name="verification_code" placeholder="000000" /></label>
-          <button class="btn" type="submit">{{ui $.Lang "create_user"}}</button>
-        </form>
-        {{end}}
-        <table>
-          <thead>
-            <tr><th>{{ui $.Lang "user_id"}}</th><th>{{ui $.Lang "role"}}</th><th>{{ui $.Lang "status"}}</th></tr>
-          </thead>
+          <thead><tr><th>ID</th><th>Email</th><th>Role</th><th>Status</th></tr></thead>
           <tbody>
             {{range .Users}}
-              <tr>
-                <td class="mono">{{.User.ID}}</td>
-                <td>
-                  {{if and (eq $.Claims.Role "owner") (ne .Role "owner")}}
-                    <form class="inline" method="post" action="/admin/users/role">
-                      <input type="hidden" name="user_id" value="{{.User.ID}}" />
-                      <select name="role">
-                        <option value="admin" {{if eq .Role "admin"}}selected{{end}}>{{enum $.Lang "role" "admin"}}</option>
-                        <option value="member" {{if eq .Role "member"}}selected{{end}}>{{enum $.Lang "role" "member"}}</option>
-                      </select>
-                      <button class="btn" type="submit">{{ui $.Lang "save"}}</button>
-                    </form>
-                  {{else}}
-                    {{enum $.Lang "role" .Role}}
-                  {{end}}
-                </td>
-                <td>
-                  {{if and (eq $.Claims.Role "owner") (ne .Role "owner")}}
-                    <form class="inline" method="post" action="/admin/users/status">
-                      <input type="hidden" name="user_id" value="{{.User.ID}}" />
-                      <select name="status">
-                        <option value="active" {{if eq .User.Status "active"}}selected{{end}}>{{enum $.Lang "status" "active"}}</option>
-                        <option value="disabled" {{if eq .User.Status "disabled"}}selected{{end}}>{{enum $.Lang "status" "disabled"}}</option>
-                      </select>
-                      <button class="btn" type="submit">{{ui $.Lang "save"}}</button>
-                    </form>
-                  {{else}}
-                    {{enum $.Lang "status" .User.Status}}
-                  {{end}}
-                </td>
-              </tr>
+            <tr><td>{{.User.ID}}</td><td>{{.User.Email}}</td><td>{{.Role}}</td><td>{{.User.Status}}</td></tr>
             {{end}}
           </tbody>
         </table>
       </article>
 
-      <article class="card col-8">
-        <h2>{{ui $.Lang "recent_orders"}}</h2>
+      <article class="card col-6">
+        <h2>Create User</h2>
+        <form class="stack" method="post" action="/admin/users/new">
+          <div class="f2">
+            <label>Email<input name="email" type="email" required /></label>
+            <label>Password<input name="password" type="password" required /></label>
+          </div>
+          <label>Role
+            <select name="role"><option value="member">member</option><option value="admin">admin</option></select>
+          </label>
+          <button class="btn" type="submit">Create User</button>
+        </form>
+        <hr />
+        <form class="stack" method="post" action="/admin/users/role">
+          <div class="f2">
+            <label>User ID<input name="user_id" required /></label>
+            <label>Role<select name="role"><option value="member">member</option><option value="admin">admin</option></select></label>
+          </div>
+          <button class="btn" type="submit">Update Role</button>
+        </form>
+        <hr />
+        <form class="stack" method="post" action="/admin/users/status">
+          <div class="f2">
+            <label>User ID<input name="user_id" required /></label>
+            <label>Status<select name="status"><option value="active">active</option><option value="disabled">disabled</option></select></label>
+          </div>
+          <button class="btn" type="submit">Update Status</button>
+        </form>
+      </article>
+
+      <article class="card col-6">
+        <h2>Prompt APIs</h2>
         <table>
-          <thead>
-            <tr>
-              <th>{{ui $.Lang "id"}}</th>
-              <th>{{ui $.Lang "type"}}</th>
-              <th>{{ui $.Lang "channel"}}</th>
-              <th>{{ui $.Lang "amount"}}</th>
-              <th>{{ui $.Lang "status"}}</th>
-              <th>{{ui $.Lang "created"}}</th>
-            </tr>
-          </thead>
+          <thead><tr><th>Slug</th><th>Name</th><th>Status</th><th>Model</th><th>Version</th></tr></thead>
           <tbody>
-            {{range .Orders}}
-              <tr>
-                <td class="mono">{{.ID}}</td>
-                <td>{{enum $.Lang "order_type" .Type}}</td>
-                <td>{{enum $.Lang "channel" .Channel}}</td>
-                <td>{{fmtMoney .Amount}} {{.Currency}}</td>
-                <td>{{enum $.Lang "order_status" .Status}}</td>
-                <td>{{fmtTime .CreatedAt}}</td>
-              </tr>
+            {{range .PromptAPIs}}
+            <tr><td>{{.Slug}}</td><td>{{.Name}}</td><td>{{.Status}}</td><td>{{.Model}}</td><td>{{.Version}}</td></tr>
             {{end}}
           </tbody>
         </table>
+        <hr />
+        <form class="stack" method="post" action="/admin/prompt-apis/new">
+          <div class="f3">
+            <label>Slug<input name="slug" required /></label>
+            <label>Name<input name="name" required /></label>
+            <label>Model<input name="model" required /></label>
+          </div>
+          <label>Description<input name="description" /></label>
+          <label>Variables (comma separated)<input name="variables" placeholder="name,topic" /></label>
+          <label>System Prompt<textarea name="system_prompt"></textarea></label>
+          <label>User Template<textarea name="user_template" placeholder="Summarize {{.topic}} for {{.name}}"></textarea></label>
+          <label><input type="checkbox" name="publish" checked /> publish</label>
+          <button class="btn" type="submit">Save Prompt API</button>
+        </form>
       </article>
 
       <article class="card col-12">
-        <h2>{{ui $.Lang "audit_logs"}}</h2>
+        <h2>Billing</h2>
         <table>
-          <thead>
-            <tr>
-              <th>{{ui $.Lang "id"}}</th>
-              <th>{{ui $.Lang "resource"}}</th>
-              <th>{{ui $.Lang "action"}}</th>
-              <th>{{ui $.Lang "actor"}}</th>
-              <th>{{ui $.Lang "target"}}</th>
-              <th>{{ui $.Lang "metadata"}}</th>
-              <th>{{ui $.Lang "created"}}</th>
-            </tr>
-          </thead>
+          <thead><tr><th>ID</th><th>User</th><th>Type</th><th>Amount</th><th>Currency</th><th>Status</th></tr></thead>
           <tbody>
-            {{range .Audits}}
-              <tr>
-                <td class="mono">{{.ID}}</td>
-                <td>{{enum $.Lang "audit_resource" .Resource}}</td>
-                <td>{{enum $.Lang "audit_action" .Action}}</td>
-                <td class="mono">{{.ActorUserID}}</td>
-                <td class="mono">{{.TargetID}}</td>
-                <td class="mono">{{metaText .Metadata}}</td>
-                <td>{{fmtTime .CreatedAt}}</td>
-              </tr>
+            {{range .Orders}}
+            <tr><td>{{.ID}}</td><td>{{.UserID}}</td><td>{{.Type}}</td><td>{{.Amount}}</td><td>{{.Currency}}</td><td>{{.Status}}</td></tr>
             {{end}}
           </tbody>
         </table>
@@ -675,517 +440,1242 @@ var adminDashboardTemplate = template.Must(template.New("admin-dashboard").Funcs
     </section>
   </main>
 </body>
-</html>
-`))
+</html>`))
 
 func (h *handler) adminLoginPage(w http.ResponseWriter, r *http.Request) {
-	if claims, ok := h.adminClaimsFromRequest(r); ok && (claims.Role == "owner" || claims.Role == "admin") {
-		http.Redirect(w, r, "/admin", http.StatusSeeOther)
+	lang := detectLanguage(r)
+	if claims, ok := h.adminClaimsFromRequest(r); ok && claims.Role == "admin" {
+		http.Redirect(w, r, withLangPath("/admin/users", lang), http.StatusSeeOther)
 		return
 	}
-
-	view := adminLoginView{
-		Lang:    detectLanguage(r),
-		Message: adminFlashMessage(r, r.URL.Query().Get("msg")),
-		Error:   adminErrorMessage(r, r.URL.Query().Get("error")),
-		Channel: "phone",
+	hasAdmin, err := h.hasAdminAccount(r.Context())
+	if err != nil {
+		writeLocalizedPlainError(w, r, http.StatusServiceUnavailable, "user_service_unavailable", "user service unavailable")
+		return
 	}
-	w.Header().Set("Content-Language", view.Lang)
-	_ = adminLoginTemplate.Execute(w, view)
+	if !hasAdmin {
+		http.Redirect(w, r, withLangPath("/admin/setup", lang), http.StatusSeeOther)
+		return
+	}
+	_ = adminLoginTemplate.Execute(w, adminLoginView{
+		Lang:  lang,
+		Error: adminErrorMessage(r, strings.TrimSpace(r.URL.Query().Get("error"))),
+	})
 }
 
 func (h *handler) adminLoginSubmit(w http.ResponseWriter, r *http.Request) {
+	lang := detectLanguage(r)
 	if h.userService == nil {
 		writeLocalizedPlainError(w, r, http.StatusServiceUnavailable, "user_service_unavailable", "user service unavailable")
 		return
 	}
 	if err := r.ParseForm(); err != nil {
-		adminRenderLogin(w, r, adminLoginView{Error: "invalid_form_data", Channel: "phone"})
+		writeLocalizedPlainError(w, r, http.StatusBadRequest, "invalid_auth_request", "invalid form data")
 		return
 	}
 
-	channel := strings.TrimSpace(r.FormValue("channel"))
-	identifier := strings.TrimSpace(r.FormValue("identifier"))
-	code := strings.TrimSpace(r.FormValue("verification_code"))
-	tenantName := strings.TrimSpace(r.FormValue("tenant_name"))
-	action := strings.ToLower(strings.TrimSpace(r.FormValue("action")))
-
-	view := adminLoginView{
-		Channel:          channel,
-		Identifier:       identifier,
-		VerificationCode: code,
-		TenantName:       tenantName,
-	}
-
-	var (
-		res user.AuthResult
-		err error
-	)
-	if action == "signup" {
-		res, err = h.userService.Signup(r.Context(), user.SignupRequest{
-			Channel:          channel,
-			Identifier:       identifier,
-			VerificationCode: code,
-			TenantName:       tenantName,
-		})
-	} else {
-		res, err = h.userService.Signin(r.Context(), user.SigninRequest{
-			Channel:          channel,
-			Identifier:       identifier,
-			VerificationCode: code,
-		})
-	}
+	hasAdmin, err := h.hasAdminAccount(r.Context())
 	if err != nil {
-		view.Error = adminUserErrorCode(err)
-		adminRenderLogin(w, r, view)
+		writeLocalizedPlainError(w, r, http.StatusServiceUnavailable, "user_service_unavailable", "user service unavailable")
+		return
+	}
+	if !hasAdmin {
+		http.Redirect(w, r, withLangPath("/admin/setup", lang), http.StatusSeeOther)
 		return
 	}
 
-	setAdminSessionCookie(w, res.Token, res.Claims.Exp)
-	http.Redirect(w, r, "/admin?msg=sign_in_success", http.StatusSeeOther)
+	email := strings.TrimSpace(r.FormValue("email"))
+	password := strings.TrimSpace(r.FormValue("password"))
+
+	res, err := h.userService.Signin(r.Context(), user.SigninRequest{Email: email, Password: password})
+	if err != nil {
+		http.Redirect(w, r, withQuery(withLangPath("/admin/login", lang), "error", err.Error()), http.StatusSeeOther)
+		return
+	}
+	if res.Role != "admin" {
+		http.Redirect(w, r, withQuery(withLangPath("/admin/login", lang), "error", "permission denied: admin only"), http.StatusSeeOther)
+		return
+	}
+
+	h.setAdminSessionCookie(w, res.Token)
+	http.Redirect(w, r, withQuery(withLangPath("/admin/users", lang), "message", "sign_in_success"), http.StatusSeeOther)
+}
+
+func (h *handler) adminSetupPage(w http.ResponseWriter, r *http.Request) {
+	lang := detectLanguage(r)
+	if claims, ok := h.adminClaimsFromRequest(r); ok && claims.Role == "admin" {
+		http.Redirect(w, r, withLangPath("/admin/users", lang), http.StatusSeeOther)
+		return
+	}
+	hasAdmin, err := h.hasAdminAccount(r.Context())
+	if err != nil {
+		writeLocalizedPlainError(w, r, http.StatusServiceUnavailable, "user_service_unavailable", "user service unavailable")
+		return
+	}
+	if hasAdmin {
+		http.Redirect(w, r, withLangPath("/admin/login", lang), http.StatusSeeOther)
+		return
+	}
+	_ = adminSetupTemplate.Execute(w, adminSetupView{
+		Lang:  lang,
+		Error: adminErrorMessage(r, strings.TrimSpace(r.URL.Query().Get("error"))),
+	})
+}
+
+func (h *handler) adminSetupSubmit(w http.ResponseWriter, r *http.Request) {
+	lang := detectLanguage(r)
+	if h.userService == nil {
+		writeLocalizedPlainError(w, r, http.StatusServiceUnavailable, "user_service_unavailable", "user service unavailable")
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		writeLocalizedPlainError(w, r, http.StatusBadRequest, "invalid_auth_request", "invalid form data")
+		return
+	}
+	hasAdmin, err := h.hasAdminAccount(r.Context())
+	if err != nil {
+		writeLocalizedPlainError(w, r, http.StatusServiceUnavailable, "user_service_unavailable", "user service unavailable")
+		return
+	}
+	if hasAdmin {
+		http.Redirect(w, r, withLangPath("/admin/login", lang), http.StatusSeeOther)
+		return
+	}
+
+	email := strings.TrimSpace(r.FormValue("email"))
+	password := strings.TrimSpace(r.FormValue("password"))
+	passwordConfirm := strings.TrimSpace(r.FormValue("password_confirm"))
+	if password != passwordConfirm {
+		http.Redirect(w, r, withQuery(withLangPath("/admin/setup", lang), "error", "password confirmation mismatch"), http.StatusSeeOther)
+		return
+	}
+
+	res, err := h.userService.BootstrapAdmin(r.Context(), user.SignupRequest{Email: email, Password: password})
+	if err != nil {
+		http.Redirect(w, r, withQuery(withLangPath("/admin/setup", lang), "error", err.Error()), http.StatusSeeOther)
+		return
+	}
+	h.setAdminSessionCookie(w, res.Token)
+	http.Redirect(w, r, withQuery(withLangPath("/admin/users", lang), "message", "admin_setup_complete"), http.StatusSeeOther)
 }
 
 func (h *handler) adminLogout(w http.ResponseWriter, r *http.Request) {
-	clearAdminSessionCookie(w)
-	http.Redirect(w, r, "/admin/login?msg=signed_out", http.StatusSeeOther)
+	lang := detectLanguage(r)
+	if cookie, err := r.Cookie(adminSessionCookieName); err == nil {
+		_ = h.userService.Logout(r.Context(), cookie.Value)
+	}
+	h.clearAdminSessionCookie(w)
+	http.Redirect(w, r, withLangPath("/admin/login", lang), http.StatusSeeOther)
 }
 
 func (h *handler) adminDashboard(w http.ResponseWriter, r *http.Request) {
+	lang := detectLanguage(r)
 	claims := SessionClaimsFromContext(r.Context())
-	view := adminDashboardView{
-		Lang:    detectLanguage(r),
-		Message: adminFlashMessage(r, r.URL.Query().Get("msg")),
-		Error:   adminErrorMessage(r, r.URL.Query().Get("error")),
-		Claims:  claims,
+	if claims.UserID == "" {
+		http.Redirect(w, r, withQuery(withLangPath("/admin/login", lang), "error", "invalid_session"), http.StatusSeeOther)
+		return
 	}
-
 	if h.userService == nil {
-		view.Error = adminErrorMessage(r, "user_service_unavailable")
-		w.Header().Set("Content-Language", view.Lang)
-		_ = adminDashboardTemplate.Execute(w, view)
+		writeLocalizedPlainError(w, r, http.StatusServiceUnavailable, "user_service_unavailable", "user service unavailable")
 		return
 	}
 
 	me, err := h.userService.GetMe(r.Context(), claims)
 	if err != nil {
-		view.Error = adminErrorMessage(r, adminUserErrorCode(err))
-		w.Header().Set("Content-Language", view.Lang)
-		_ = adminDashboardTemplate.Execute(w, view)
+		http.Redirect(w, r, withQuery(withLangPath("/admin/login", lang), "error", "invalid_session"), http.StatusSeeOther)
 		return
 	}
-	view.Me = me
 
-	if users, listErr := h.userService.ListTenantUsers(r.Context(), claims); listErr == nil {
+	view := adminDashboardView{Claims: claims, Me: me, Message: strings.TrimSpace(r.URL.Query().Get("message")), Error: strings.TrimSpace(r.URL.Query().Get("error"))}
+	if users, err := h.userService.ListUsers(r.Context(), claims); err == nil {
 		view.Users = users
-	} else {
-		view.Issues = append(view.Issues, adminIssueMessage(r, "list_users", listErr))
 	}
-
-	if h.policySync != nil {
-		if keys, _, listErr := h.policySync.List(r.Context(), keymgmt.ListQuery{TenantID: claims.TenantID, Limit: 200}); listErr == nil {
-			view.Keys = keys
-		} else {
-			view.Issues = append(view.Issues, adminIssueMessage(r, "list_api_keys", listErr))
-		}
-	}
-
 	if h.promptAPI != nil {
-		if page, listErr := h.promptAPI.List(r.Context(), promptapi.ListQuery{TenantID: claims.TenantID, Limit: 200}); listErr == nil {
+		if page, err := h.promptAPI.List(r.Context(), promptapi.ListQuery{Limit: 200}); err == nil {
 			view.PromptAPIs = page.Data
-		} else {
-			view.Issues = append(view.Issues, adminIssueMessage(r, "list_prompt_apis", listErr))
 		}
 	}
-
 	if h.billing != nil {
-		if balance, balErr := h.billing.GetBalance(r.Context(), claims.TenantID); balErr == nil {
-			view.Balance = balance
-		} else {
-			view.Issues = append(view.Issues, adminIssueMessage(r, "load_balance", balErr))
-		}
-		if orders, orderErr := h.billing.ListOrdersAdmin(r.Context(), billing.OrderQuery{TenantID: claims.TenantID, Limit: 20}); orderErr == nil {
-			view.Orders = orders.Data
-		} else {
-			view.Issues = append(view.Issues, adminIssueMessage(r, "list_orders", orderErr))
+		if page, err := h.billing.ListOrdersAdmin(r.Context(), billing.OrderQuery{Limit: 20}); err == nil {
+			view.Orders = page.Data
 		}
 	}
 
-	if h.audit != nil {
-		if page, auditErr := h.audit.List(r.Context(), audit.Query{TargetTenantID: claims.TenantID, Limit: 30}); auditErr == nil {
-			view.Audits = page.Data
-		} else {
-			view.Issues = append(view.Issues, adminIssueMessage(r, "list_audits", auditErr))
-		}
-	}
-
-	w.Header().Set("Content-Language", view.Lang)
 	_ = adminDashboardTemplate.Execute(w, view)
 }
 
-func (h *handler) adminKeyCreate(w http.ResponseWriter, r *http.Request) {
-	claims := SessionClaimsFromContext(r.Context())
-	if h.policySync == nil {
-		adminRedirect(w, r, "", "policy_sync_unavailable")
-		return
-	}
-	if err := r.ParseForm(); err != nil {
-		adminRedirect(w, r, "", "invalid_form_data")
-		return
-	}
-
-	apiKey := strings.TrimSpace(r.FormValue("api_key"))
-	if apiKey == "" {
-		adminRedirect(w, r, "", "api_key_required")
-		return
-	}
-	enabled := parseCheckbox(r.FormValue("enabled"))
-	rpm, err := parseOptionalPositiveInt(r.FormValue("rpm_limit"))
-	if err != nil {
-		adminRedirect(w, r, "", "rpm_limit_invalid")
-		return
-	}
-	daily, err := parseOptionalPositiveInt(r.FormValue("daily_token_limit"))
-	if err != nil {
-		adminRedirect(w, r, "", "daily_token_limit_invalid")
-		return
-	}
-
-	tenantID := claims.TenantID
-	record, err := h.policySync.Upsert(r.Context(), keymgmt.UpsertPolicyInput{
-		APIKey:          apiKey,
-		TenantID:        &tenantID,
-		Enabled:         &enabled,
-		RPMLimit:        rpm,
-		DailyTokenLimit: daily,
-	})
-	if err != nil {
-		adminRedirect(w, r, "", "save_api_key_failed:"+err.Error())
-		return
-	}
-	if h.audit != nil {
-		_, _ = h.audit.Record(r.Context(), audit.RecordInput{
-			Resource:       "api_key",
-			Action:         "upsert",
-			ActorUserID:    claims.UserID,
-			ActorTenantID:  claims.TenantID,
-			TargetID:       record.KeyHash,
-			TargetTenantID: record.TenantID,
-			Metadata: map[string]string{
-				"enabled":           strconv.FormatBool(record.Enabled),
-				"rpm_limit":         strconv.Itoa(record.RPMLimit),
-				"daily_token_limit": strconv.Itoa(record.DailyTokenLimit),
-			},
-		})
-	}
-	adminRedirect(w, r, "api_key_saved", "")
-}
-
-func (h *handler) adminKeyDelete(w http.ResponseWriter, r *http.Request) {
-	claims := SessionClaimsFromContext(r.Context())
-	if h.policySync == nil {
-		adminRedirect(w, r, "", "policy_sync_unavailable")
-		return
-	}
-	if err := r.ParseForm(); err != nil {
-		adminRedirect(w, r, "", "invalid_form_data")
-		return
-	}
-
-	keyHash := strings.TrimSpace(r.FormValue("key_hash"))
-	if keyHash == "" {
-		adminRedirect(w, r, "", "key_hash_required")
-		return
-	}
-	if err := h.policySync.DeleteForTenant(r.Context(), keyHash, claims.TenantID); err != nil {
-		adminRedirect(w, r, "", "delete_api_key_failed:"+err.Error())
-		return
-	}
-	if h.audit != nil {
-		_, _ = h.audit.Record(r.Context(), audit.RecordInput{
-			Resource:      "api_key",
-			Action:        "delete",
-			ActorUserID:   claims.UserID,
-			ActorTenantID: claims.TenantID,
-			TargetID:      keyHash,
-		})
-	}
-	adminRedirect(w, r, "api_key_deleted", "")
-}
-
 func (h *handler) adminPromptCreate(w http.ResponseWriter, r *http.Request) {
-	claims := SessionClaimsFromContext(r.Context())
 	if h.promptAPI == nil {
-		adminRedirect(w, r, "", "prompt_api_unavailable")
+		h.redirectAdminWithError(w, r, "save_prompt_api_failed: prompt api unavailable")
 		return
 	}
 	if err := r.ParseForm(); err != nil {
-		adminRedirect(w, r, "", "invalid_form_data")
+		h.redirectAdminWithError(w, r, "invalid form data")
 		return
 	}
 
-	variables := splitVariables(r.FormValue("variables"))
-	def, err := h.promptAPI.Upsert(r.Context(), claims.TenantID, promptapi.UpsertRequest{
-		Slug:         strings.TrimSpace(r.FormValue("slug")),
-		Name:         strings.TrimSpace(r.FormValue("name")),
-		Description:  strings.TrimSpace(r.FormValue("description")),
-		Model:        strings.TrimSpace(r.FormValue("model")),
-		SystemPrompt: strings.TrimSpace(r.FormValue("system_prompt")),
-		UserTemplate: strings.TrimSpace(r.FormValue("user_template")),
-		Variables:    variables,
-		Publish:      parseCheckbox(r.FormValue("publish")),
-	})
+	req := buildPromptUpsertRequestFromForm(r)
+	def, err := h.promptAPI.Upsert(r.Context(), req)
 	if err != nil {
-		adminRedirect(w, r, "", "save_prompt_api_failed:"+err.Error())
+		h.redirectAdminWithError(w, r, "save_prompt_api_failed: "+err.Error())
 		return
 	}
-	adminRedirect(w, r, "prompt_api_saved:"+def.Slug, "")
+	h.redirectAdminWithMessage(w, r, "prompt_api_saved:"+def.Slug)
 }
 
-func (h *handler) adminBillingTopup(w http.ResponseWriter, r *http.Request) {
-	claims := SessionClaimsFromContext(r.Context())
-	if h.billing == nil {
-		adminRedirect(w, r, "", "billing_unavailable")
+func (h *handler) adminPromptPreview(w http.ResponseWriter, r *http.Request) {
+	if h.promptAPI == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "prompt api unavailable"})
+		return
+	}
+	if h.gateway == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "gateway unavailable"})
 		return
 	}
 	if err := r.ParseForm(); err != nil {
-		adminRedirect(w, r, "", "invalid_form_data")
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid form data"})
 		return
 	}
 
-	amount, err := strconv.ParseFloat(strings.TrimSpace(r.FormValue("amount")), 64)
-	if err != nil || amount <= 0 {
-		adminRedirect(w, r, "", "amount_invalid")
-		return
+	req := buildPromptUpsertRequestFromForm(r)
+	if strings.TrimSpace(req.Slug) == "" {
+		req.Slug = "preview"
+	}
+	if strings.TrimSpace(req.Name) == "" {
+		req.Name = "Prompt Preview"
 	}
 
-	_, _, err = h.billing.Topup(r.Context(), claims.TenantID, billing.TopupRequest{
-		Channel:     strings.TrimSpace(r.FormValue("channel")),
-		Amount:      amount,
-		Currency:    strings.TrimSpace(r.FormValue("currency")),
-		Description: strings.TrimSpace(r.FormValue("description")),
-	})
+	previewInput, err := parsePromptPreviewInput(r.FormValue("preview_input"), req.Variables)
 	if err != nil {
-		adminRedirect(w, r, "", "topup_failed:"+err.Error())
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid preview input json: " + err.Error()})
 		return
 	}
-	adminRedirect(w, r, "topup_success", "")
+
+	def, providerReq, renderedUserPrompt, err := h.promptAPI.BuildPreviewChatRequest(req, previewInput)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, promptapi.ErrStoreUnavailable) {
+			status = http.StatusServiceUnavailable
+		}
+		writeJSON(w, status, map[string]any{"error": err.Error()})
+		return
+	}
+
+	result, err := h.gateway.Chat(r.Context(), providerReq)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "upstream provider request failed: " + err.Error()})
+		return
+	}
+
+	systemPrompt := ""
+	if len(providerReq.Messages) > 0 && providerReq.Messages[0].Role == "system" {
+		systemPrompt = providerReq.Messages[0].Content
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"definition": map[string]any{
+			"slug":          def.Slug,
+			"name":          def.Name,
+			"model":         def.Model,
+			"variables":     def.Variables,
+			"input_schema":  def.InputSchema,
+			"output_schema": def.OutputSchema,
+		},
+		"preview": map[string]any{
+			"input":             previewInput,
+			"rendered_system":   systemPrompt,
+			"rendered_user":     renderedUserPrompt,
+			"assistant_reply":   strings.TrimSpace(result.Content),
+			"provider_model":    result.Model,
+			"prompt_tokens":     result.PromptTokens,
+			"completion_tokens": result.CompletionTokens,
+			"total_tokens":      result.PromptTokens + result.CompletionTokens,
+		},
+	})
+}
+
+func (h *handler) adminUpstreamDiagnose(w http.ResponseWriter, r *http.Request) {
+	if h.upstream == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "upstream service unavailable"})
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid form data"})
+		return
+	}
+
+	payload, err := h.performUpstreamDiagnose(
+		r.Context(),
+		r.FormValue("id"),
+		r.FormValue("model"),
+		r.FormValue("system_prompt"),
+		r.FormValue("user_prompt"),
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, errMissingUpstreamID):
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		case errors.Is(err, upstream.ErrUpstreamNotFound):
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": err.Error()})
+		default:
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func (h *handler) performUpstreamDiagnose(ctx context.Context, upstreamID, model, systemPrompt, userPrompt string) (upstreamDiagnosePayload, error) {
+	targetID := strings.TrimSpace(upstreamID)
+	if targetID == "" {
+		return upstreamDiagnosePayload{}, errMissingUpstreamID
+	}
+	items, err := h.upstream.ListUpstreams()
+	if err != nil {
+		return upstreamDiagnosePayload{}, fmt.Errorf("list upstreams failed: %w", err)
+	}
+	item, ok := findUpstreamByID(items, targetID)
+	if !ok {
+		return upstreamDiagnosePayload{}, upstream.ErrUpstreamNotFound
+	}
+
+	healthResults, err := h.upstream.CheckHealth(ctx, targetID)
+	if err != nil {
+		return upstreamDiagnosePayload{}, fmt.Errorf("check upstream failed: %w", err)
+	}
+
+	payload := upstreamDiagnosePayload{
+		Health: map[string]any{
+			"upstream_id":   item.ID,
+			"upstream_name": item.Name,
+			"provider_type": item.Type,
+			"base_url":      item.BaseURL,
+			"enabled":       item.Enabled,
+		},
+	}
+	if len(healthResults) > 0 {
+		healthResult := healthResults[0]
+		payload.Health["healthy"] = healthResult.Healthy
+		payload.Health["latency_ms"] = healthResult.LatencyMS
+		payload.Health["http_status"] = healthResult.HTTPCode
+		payload.Health["endpoint"] = healthResult.Endpoint
+		payload.Health["error"] = healthResult.Error
+		payload.Health["checked_at"] = healthResult.CheckedAt
+		payload.Health["raw_response"] = healthResult.Response
+	}
+
+	targetModel := strings.TrimSpace(model)
+	if targetModel == "" && len(item.Models) > 0 {
+		targetModel = strings.TrimSpace(item.Models[0])
+	}
+	if targetModel == "" {
+		payload.ProbeError = "model is required"
+		return payload, nil
+	}
+
+	system := strings.TrimSpace(systemPrompt)
+	userContent := strings.TrimSpace(userPrompt)
+	if userContent == "" {
+		userContent = "请回复“pong”并简短说明当前模型名。"
+	}
+
+	messages := make([]provider.Message, 0, 2)
+	if system != "" {
+		messages = append(messages, provider.Message{Role: "system", Content: system})
+	}
+	messages = append(messages, provider.Message{Role: "user", Content: userContent})
+
+	start := time.Now()
+	result, err := runUpstreamProbe(ctx, item, provider.ChatRequest{
+		Model:    targetModel,
+		Messages: messages,
+	})
+	latency := time.Since(start).Milliseconds()
+	if err != nil {
+		payload.ProbeError = err.Error()
+		payload.Probe = map[string]any{
+			"upstream_id":         item.ID,
+			"upstream_name":       item.Name,
+			"provider_type":       item.Type,
+			"base_url":            item.BaseURL,
+			"requested_model":     targetModel,
+			"latency_ms":          latency,
+			"http_status":         result.HTTPStatus,
+			"endpoint":            result.Endpoint,
+			"raw_response":        result.RawResponse,
+			"upstream_is_enabled": item.Enabled,
+		}
+		return payload, nil
+	}
+
+	payload.Probe = map[string]any{
+		"upstream_id":         item.ID,
+		"upstream_name":       item.Name,
+		"provider_type":       item.Type,
+		"base_url":            item.BaseURL,
+		"requested_model":     targetModel,
+		"provider_model":      result.Chat.Model,
+		"assistant_reply":     strings.TrimSpace(result.Chat.Content),
+		"latency_ms":          latency,
+		"prompt_tokens":       result.Chat.PromptTokens,
+		"completion_tokens":   result.Chat.CompletionTokens,
+		"total_tokens":        result.Chat.PromptTokens + result.Chat.CompletionTokens,
+		"http_status":         result.HTTPStatus,
+		"endpoint":            result.Endpoint,
+		"raw_response":        result.RawResponse,
+		"upstream_is_enabled": item.Enabled,
+	}
+	return payload, nil
+}
+
+func findUpstreamByID(items []upstream.Upstream, id string) (upstream.Upstream, bool) {
+	target := strings.TrimSpace(id)
+	for _, item := range items {
+		if item.ID == target {
+			return item, true
+		}
+	}
+	return upstream.Upstream{}, false
+}
+
+type upstreamProbeResult struct {
+	Chat        provider.ChatResult
+	Endpoint    string
+	HTTPStatus  int
+	RawResponse string
+}
+
+type upstreamDiagnosePayload struct {
+	Health     map[string]any `json:"health"`
+	Probe      map[string]any `json:"probe,omitempty"`
+	ProbeError string         `json:"probe_error,omitempty"`
+}
+
+var errMissingUpstreamID = errors.New("missing upstream id")
+
+func runUpstreamProbe(ctx context.Context, item upstream.Upstream, req provider.ChatRequest) (upstreamProbeResult, error) {
+	switch item.Type {
+	case upstream.ProviderOpenAICompat:
+		return runOpenAICompatProbe(ctx, item, req)
+	case upstream.ProviderAnthropic:
+		return runAnthropicProbe(ctx, item, req)
+	case upstream.ProviderGemini:
+		return runGeminiProbe(ctx, item, req)
+	case upstream.ProviderOllama:
+		return runOllamaProbe(ctx, item, req)
+	default:
+		return upstreamProbeResult{}, fmt.Errorf("unsupported upstream provider type: %s", item.Type)
+	}
+}
+
+func runOpenAICompatProbe(ctx context.Context, item upstream.Upstream, req provider.ChatRequest) (upstreamProbeResult, error) {
+	model := strings.TrimSpace(req.Model)
+	if model == "" {
+		model = "gpt-4o-mini"
+	}
+	messages := make([]map[string]string, 0, len(req.Messages))
+	for _, m := range req.Messages {
+		messages = append(messages, map[string]string{
+			"role":    strings.TrimSpace(m.Role),
+			"content": m.Content,
+		})
+	}
+	payload := map[string]any{
+		"model":    model,
+		"messages": messages,
+		"stream":   false,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return upstreamProbeResult{}, err
+	}
+	base := strings.TrimRight(strings.TrimSpace(item.BaseURL), "/")
+	route := "/v1/chat/completions"
+	if strings.HasSuffix(base, "/v1") {
+		route = "/chat/completions"
+	}
+	endpoint := base + route
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return upstreamProbeResult{}, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if strings.TrimSpace(item.APIKey) != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+strings.TrimSpace(item.APIKey))
+	}
+
+	result, raw, status, err := executeProbeRequest(httpReq)
+	if err != nil {
+		return upstreamProbeResult{Endpoint: endpoint, HTTPStatus: status, RawResponse: raw}, err
+	}
+	var parsed struct {
+		Model   string `json:"model"`
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(result, &parsed); err != nil {
+		return upstreamProbeResult{Endpoint: endpoint, HTTPStatus: status, RawResponse: raw}, err
+	}
+	if len(parsed.Choices) == 0 {
+		return upstreamProbeResult{Endpoint: endpoint, HTTPStatus: status, RawResponse: raw}, provider.ErrUpstreamResponse
+	}
+	outModel := strings.TrimSpace(parsed.Model)
+	if outModel == "" {
+		outModel = model
+	}
+	return upstreamProbeResult{
+		Endpoint:    endpoint,
+		HTTPStatus:  status,
+		RawResponse: raw,
+		Chat: provider.ChatResult{
+			Model:            "openai/" + outModel,
+			Content:          parsed.Choices[0].Message.Content,
+			PromptTokens:     parsed.Usage.PromptTokens,
+			CompletionTokens: parsed.Usage.CompletionTokens,
+		},
+	}, nil
+}
+
+func runAnthropicProbe(ctx context.Context, item upstream.Upstream, req provider.ChatRequest) (upstreamProbeResult, error) {
+	model := strings.TrimSpace(req.Model)
+	if model == "" {
+		model = "claude-3-5-haiku-latest"
+	}
+	systemPrompt := make([]string, 0, 2)
+	type anthropicMessage struct {
+		Role    string `json:"role"`
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	messages := make([]anthropicMessage, 0, len(req.Messages))
+	for _, m := range req.Messages {
+		role := strings.ToLower(strings.TrimSpace(m.Role))
+		content := strings.TrimSpace(m.Content)
+		if role == "system" {
+			if content != "" {
+				systemPrompt = append(systemPrompt, content)
+			}
+			continue
+		}
+		targetRole := "user"
+		if role == "assistant" {
+			targetRole = "assistant"
+		}
+		block := struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}{Type: "text", Text: content}
+		messages = append(messages, anthropicMessage{
+			Role: targetRole,
+			Content: []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			}{block},
+		})
+	}
+	if len(messages) == 0 {
+		return upstreamProbeResult{}, provider.ErrUpstreamResponse
+	}
+	payload := map[string]any{
+		"model":      model,
+		"messages":   messages,
+		"max_tokens": 1024,
+	}
+	if len(systemPrompt) > 0 {
+		payload["system"] = strings.Join(systemPrompt, "\n\n")
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return upstreamProbeResult{}, err
+	}
+	base := strings.TrimRight(strings.TrimSpace(item.BaseURL), "/")
+	route := "/v1/messages"
+	if strings.HasSuffix(base, "/v1") {
+		route = "/messages"
+	}
+	endpoint := base + route
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return upstreamProbeResult{}, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("anthropic-version", "2023-06-01")
+	if strings.TrimSpace(item.APIKey) != "" {
+		httpReq.Header.Set("x-api-key", strings.TrimSpace(item.APIKey))
+	}
+
+	result, raw, status, err := executeProbeRequest(httpReq)
+	if err != nil {
+		return upstreamProbeResult{Endpoint: endpoint, HTTPStatus: status, RawResponse: raw}, err
+	}
+	var parsed struct {
+		Model   string `json:"model"`
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+		Usage struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(result, &parsed); err != nil {
+		return upstreamProbeResult{Endpoint: endpoint, HTTPStatus: status, RawResponse: raw}, err
+	}
+	if len(parsed.Content) == 0 {
+		return upstreamProbeResult{Endpoint: endpoint, HTTPStatus: status, RawResponse: raw}, provider.ErrUpstreamResponse
+	}
+	out := make([]string, 0, len(parsed.Content))
+	for _, c := range parsed.Content {
+		if strings.TrimSpace(c.Text) != "" {
+			out = append(out, c.Text)
+		}
+	}
+	if len(out) == 0 {
+		return upstreamProbeResult{Endpoint: endpoint, HTTPStatus: status, RawResponse: raw}, provider.ErrUpstreamResponse
+	}
+	outModel := strings.TrimSpace(parsed.Model)
+	if outModel == "" {
+		outModel = model
+	}
+	return upstreamProbeResult{
+		Endpoint:    endpoint,
+		HTTPStatus:  status,
+		RawResponse: raw,
+		Chat: provider.ChatResult{
+			Model:            "anthropic/" + outModel,
+			Content:          strings.Join(out, "\n"),
+			PromptTokens:     parsed.Usage.InputTokens,
+			CompletionTokens: parsed.Usage.OutputTokens,
+		},
+	}, nil
+}
+
+func runGeminiProbe(ctx context.Context, item upstream.Upstream, req provider.ChatRequest) (upstreamProbeResult, error) {
+	model := strings.TrimPrefix(strings.TrimSpace(req.Model), "models/")
+	if model == "" {
+		model = "gemini-2.0-flash"
+	}
+	systemPrompt := make([]string, 0, 2)
+	type geminiPart struct {
+		Text string `json:"text"`
+	}
+	type geminiContent struct {
+		Role  string       `json:"role"`
+		Parts []geminiPart `json:"parts"`
+	}
+	contents := make([]geminiContent, 0, len(req.Messages))
+	for _, m := range req.Messages {
+		role := strings.ToLower(strings.TrimSpace(m.Role))
+		text := strings.TrimSpace(m.Content)
+		if role == "system" {
+			if text != "" {
+				systemPrompt = append(systemPrompt, text)
+			}
+			continue
+		}
+		targetRole := "user"
+		if role == "assistant" {
+			targetRole = "model"
+		}
+		contents = append(contents, geminiContent{
+			Role:  targetRole,
+			Parts: []geminiPart{{Text: text}},
+		})
+	}
+	if len(contents) == 0 {
+		return upstreamProbeResult{}, provider.ErrUpstreamResponse
+	}
+	payload := map[string]any{"contents": contents}
+	if len(systemPrompt) > 0 {
+		payload["system_instruction"] = map[string]any{
+			"parts": []map[string]string{{"text": strings.Join(systemPrompt, "\n\n")}},
+		}
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return upstreamProbeResult{}, err
+	}
+	base := strings.TrimRight(strings.TrimSpace(item.BaseURL), "/")
+	route := "/v1beta/models/" + url.PathEscape(model) + ":generateContent"
+	if strings.HasSuffix(base, "/v1beta") || strings.HasSuffix(base, "/v1") {
+		route = "/models/" + url.PathEscape(model) + ":generateContent"
+	}
+	endpoint := base + route
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return upstreamProbeResult{}, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if strings.TrimSpace(item.APIKey) != "" {
+		httpReq.Header.Set("x-goog-api-key", strings.TrimSpace(item.APIKey))
+	}
+
+	result, raw, status, err := executeProbeRequest(httpReq)
+	if err != nil {
+		return upstreamProbeResult{Endpoint: endpoint, HTTPStatus: status, RawResponse: raw}, err
+	}
+	var parsed struct {
+		ModelVersion string `json:"modelVersion"`
+		Candidates   []struct {
+			Content struct {
+				Parts []struct {
+					Text string `json:"text"`
+				} `json:"parts"`
+			} `json:"content"`
+		} `json:"candidates"`
+		UsageMetadata struct {
+			PromptTokenCount     int `json:"promptTokenCount"`
+			CandidatesTokenCount int `json:"candidatesTokenCount"`
+		} `json:"usageMetadata"`
+	}
+	if err := json.Unmarshal(result, &parsed); err != nil {
+		return upstreamProbeResult{Endpoint: endpoint, HTTPStatus: status, RawResponse: raw}, err
+	}
+	if len(parsed.Candidates) == 0 || len(parsed.Candidates[0].Content.Parts) == 0 {
+		return upstreamProbeResult{Endpoint: endpoint, HTTPStatus: status, RawResponse: raw}, provider.ErrUpstreamResponse
+	}
+	out := make([]string, 0, len(parsed.Candidates[0].Content.Parts))
+	for _, p := range parsed.Candidates[0].Content.Parts {
+		if strings.TrimSpace(p.Text) != "" {
+			out = append(out, p.Text)
+		}
+	}
+	if len(out) == 0 {
+		return upstreamProbeResult{Endpoint: endpoint, HTTPStatus: status, RawResponse: raw}, provider.ErrUpstreamResponse
+	}
+	outModel := strings.TrimSpace(parsed.ModelVersion)
+	if outModel == "" {
+		outModel = model
+	}
+	return upstreamProbeResult{
+		Endpoint:    endpoint,
+		HTTPStatus:  status,
+		RawResponse: raw,
+		Chat: provider.ChatResult{
+			Model:            "gemini/" + outModel,
+			Content:          strings.Join(out, "\n"),
+			PromptTokens:     parsed.UsageMetadata.PromptTokenCount,
+			CompletionTokens: parsed.UsageMetadata.CandidatesTokenCount,
+		},
+	}, nil
+}
+
+func runOllamaProbe(ctx context.Context, item upstream.Upstream, req provider.ChatRequest) (upstreamProbeResult, error) {
+	model := strings.TrimSpace(req.Model)
+	if model == "" {
+		model = "llama3.1"
+	}
+	type msg struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	messages := make([]msg, 0, len(req.Messages))
+	for _, m := range req.Messages {
+		messages = append(messages, msg{Role: strings.TrimSpace(m.Role), Content: m.Content})
+	}
+	payload := map[string]any{
+		"model":    model,
+		"messages": messages,
+		"stream":   false,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return upstreamProbeResult{}, err
+	}
+	base := strings.TrimRight(strings.TrimSpace(item.BaseURL), "/")
+	endpoint := base + "/api/chat"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return upstreamProbeResult{}, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	result, raw, status, err := executeProbeRequest(httpReq)
+	if err != nil {
+		return upstreamProbeResult{Endpoint: endpoint, HTTPStatus: status, RawResponse: raw}, err
+	}
+	var parsed struct {
+		Model   string `json:"model"`
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+		PromptEvalCount int `json:"prompt_eval_count"`
+		EvalCount       int `json:"eval_count"`
+	}
+	if err := json.Unmarshal(result, &parsed); err != nil {
+		return upstreamProbeResult{Endpoint: endpoint, HTTPStatus: status, RawResponse: raw}, err
+	}
+	if strings.TrimSpace(parsed.Message.Content) == "" {
+		return upstreamProbeResult{Endpoint: endpoint, HTTPStatus: status, RawResponse: raw}, provider.ErrUpstreamResponse
+	}
+	outModel := strings.TrimSpace(parsed.Model)
+	if outModel == "" {
+		outModel = model
+	}
+	return upstreamProbeResult{
+		Endpoint:    endpoint,
+		HTTPStatus:  status,
+		RawResponse: raw,
+		Chat: provider.ChatResult{
+			Model:            "ollama/" + outModel,
+			Content:          parsed.Message.Content,
+			PromptTokens:     parsed.PromptEvalCount,
+			CompletionTokens: parsed.EvalCount,
+		},
+	}, nil
+}
+
+func executeProbeRequest(httpReq *http.Request) ([]byte, string, int, error) {
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", resp.StatusCode, err
+	}
+	text := strings.TrimSpace(string(raw))
+	if resp.StatusCode >= http.StatusBadRequest {
+		if text == "" {
+			return raw, text, resp.StatusCode, fmt.Errorf("upstream status %d", resp.StatusCode)
+		}
+		return raw, text, resp.StatusCode, fmt.Errorf("upstream status %d: %s", resp.StatusCode, text)
+	}
+	return raw, text, resp.StatusCode, nil
+}
+
+func (h *handler) adminBillingPlansUpdate(w http.ResponseWriter, r *http.Request) {
+	if h.billing == nil {
+		h.redirectAdminWithError(w, r, "update_plan_configs_failed: billing unavailable")
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		h.redirectAdminWithError(w, r, "invalid form data")
+		return
+	}
+
+	updates := make([]billing.PlanConfig, 0, len(billing.SupportedPlans()))
+	for _, planID := range billing.SupportedPlans() {
+		price, err := strconv.ParseFloat(strings.TrimSpace(r.FormValue("price_"+planID)), 64)
+		if err != nil || price < 0 {
+			h.redirectAdminWithError(w, r, "update_plan_configs_failed: invalid price for "+planID)
+			return
+		}
+		rpm, err := parseNonNegativeIntForm(r.FormValue("rpm_" + planID))
+		if err != nil {
+			h.redirectAdminWithError(w, r, "update_plan_configs_failed: invalid rpm for "+planID)
+			return
+		}
+		fiveHour, err := parseNonNegativeIntForm(r.FormValue("limit5h_" + planID))
+		if err != nil {
+			h.redirectAdminWithError(w, r, "update_plan_configs_failed: invalid 5h limit for "+planID)
+			return
+		}
+		monthly, err := parseNonNegativeIntForm(r.FormValue("limitm_" + planID))
+		if err != nil {
+			h.redirectAdminWithError(w, r, "update_plan_configs_failed: invalid monthly limit for "+planID)
+			return
+		}
+		unlimited := r.FormValue("unlimited_"+planID) == "on" || strings.EqualFold(strings.TrimSpace(r.FormValue("unlimited_"+planID)), "true")
+		updates = append(updates, billing.PlanConfig{
+			PlanID:             planID,
+			PriceCNY:           price,
+			RPMLimit:           rpm,
+			FiveHourTokenLimit: fiveHour,
+			MonthlyTokenLimit:  monthly,
+			Unlimited:          unlimited,
+		})
+	}
+	if _, err := h.billing.SetPlanConfigs(r.Context(), updates); err != nil {
+		h.redirectAdminWithError(w, r, "update_plan_configs_failed: "+err.Error())
+		return
+	}
+	h.redirectAdminWithMessage(w, r, "plan_configs_updated")
+}
+
+func parseNonNegativeIntForm(raw string) (int, error) {
+	text := strings.TrimSpace(raw)
+	if text == "" {
+		return 0, nil
+	}
+	v, err := strconv.Atoi(text)
+	if err != nil || v < 0 {
+		return 0, errors.New("invalid non-negative integer")
+	}
+	return v, nil
 }
 
 func (h *handler) adminUserCreate(w http.ResponseWriter, r *http.Request) {
-	claims := SessionClaimsFromContext(r.Context())
 	if h.userService == nil {
-		adminRedirect(w, r, "", "user_service_unavailable")
+		h.redirectAdminWithError(w, r, "create_user_failed: user service unavailable")
 		return
 	}
+	claims := SessionClaimsFromContext(r.Context())
 	if err := r.ParseForm(); err != nil {
-		adminRedirect(w, r, "", "invalid_form_data")
+		h.redirectAdminWithError(w, r, "invalid form data")
 		return
 	}
-
-	created, err := h.userService.CreateTenantUser(r.Context(), claims, user.CreateTenantUserRequest{
-		Channel:          strings.TrimSpace(r.FormValue("channel")),
-		Identifier:       strings.TrimSpace(r.FormValue("identifier")),
-		VerificationCode: strings.TrimSpace(r.FormValue("verification_code")),
-		Role:             strings.TrimSpace(r.FormValue("role")),
+	created, err := h.userService.CreateUser(r.Context(), claims, user.CreateUserRequest{
+		Email:    strings.TrimSpace(r.FormValue("email")),
+		Password: strings.TrimSpace(r.FormValue("password")),
+		Role:     strings.TrimSpace(r.FormValue("role")),
 	})
 	if err != nil {
-		adminRedirect(w, r, "", "create_user_failed:"+adminUserErrorCode(err))
+		h.redirectAdminWithError(w, r, "create_user_failed: "+err.Error())
 		return
 	}
-	if h.audit != nil {
-		_, _ = h.audit.Record(r.Context(), audit.RecordInput{
-			Resource:       "user",
-			Action:         "create",
-			ActorUserID:    claims.UserID,
-			ActorTenantID:  claims.TenantID,
-			TargetID:       created.User.ID,
-			TargetTenantID: claims.TenantID,
-			Metadata: map[string]string{
-				"role": created.Role,
-			},
-		})
-	}
-	adminRedirect(w, r, "user_created:"+created.User.ID, "")
+	h.redirectAdminWithMessage(w, r, "user_created:"+created.User.ID)
 }
 
 func (h *handler) adminUserRoleUpdate(w http.ResponseWriter, r *http.Request) {
-	claims := SessionClaimsFromContext(r.Context())
 	if h.userService == nil {
-		adminRedirect(w, r, "", "user_service_unavailable")
+		h.redirectAdminWithError(w, r, "update_user_role_failed: user service unavailable")
 		return
 	}
+	claims := SessionClaimsFromContext(r.Context())
 	if err := r.ParseForm(); err != nil {
-		adminRedirect(w, r, "", "invalid_form_data")
+		h.redirectAdminWithError(w, r, "invalid form data")
 		return
 	}
-
-	userID := strings.TrimSpace(r.FormValue("user_id"))
+	userIDs := parseBatchValues(r.FormValue("user_id"))
+	if len(userIDs) == 0 {
+		h.redirectAdminWithError(w, r, "missing user_id")
+		return
+	}
+	if containsBatchValue(userIDs, claims.UserID) {
+		h.redirectAdminWithError(w, r, "forbidden_self_sensitive_operation")
+		return
+	}
 	role := strings.TrimSpace(r.FormValue("role"))
-	updated, err := h.userService.UpdateTenantUserRole(r.Context(), claims, userID, role)
-	if err != nil {
-		adminRedirect(w, r, "", "update_user_role_failed:"+adminUserErrorCode(err))
+	if role == "" {
+		if r.FormValue("is_admin") == "on" || strings.EqualFold(strings.TrimSpace(r.FormValue("is_admin")), "true") {
+			role = "admin"
+		} else {
+			role = "member"
+		}
+	}
+	lastID := ""
+	for _, userID := range userIDs {
+		updated, err := h.userService.UpdateUserRole(r.Context(), claims, userID, role)
+		if err != nil {
+			h.redirectAdminWithError(w, r, "update_user_role_failed: "+userID+": "+err.Error())
+			return
+		}
+		lastID = updated.User.ID
+	}
+	if len(userIDs) == 1 {
+		h.redirectAdminWithMessage(w, r, "user_role_updated:"+lastID)
 		return
 	}
-	if h.audit != nil {
-		_, _ = h.audit.Record(r.Context(), audit.RecordInput{
-			Resource:       "user",
-			Action:         "update_role",
-			ActorUserID:    claims.UserID,
-			ActorTenantID:  claims.TenantID,
-			TargetID:       updated.User.ID,
-			TargetTenantID: claims.TenantID,
-			Metadata: map[string]string{
-				"role": updated.Role,
-			},
-		})
-	}
-	adminRedirect(w, r, "user_role_updated:"+updated.User.ID, "")
+	h.redirectAdminWithMessage(w, r, "user_role_updated:"+strconv.Itoa(len(userIDs)))
 }
 
 func (h *handler) adminUserStatusUpdate(w http.ResponseWriter, r *http.Request) {
-	claims := SessionClaimsFromContext(r.Context())
 	if h.userService == nil {
-		adminRedirect(w, r, "", "user_service_unavailable")
+		h.redirectAdminWithError(w, r, "update_user_status_failed: user service unavailable")
+		return
+	}
+	claims := SessionClaimsFromContext(r.Context())
+	if err := r.ParseForm(); err != nil {
+		h.redirectAdminWithError(w, r, "invalid form data")
+		return
+	}
+	userIDs := parseBatchValues(r.FormValue("user_id"))
+	if len(userIDs) == 0 {
+		h.redirectAdminWithError(w, r, "missing user_id")
+		return
+	}
+	if containsBatchValue(userIDs, claims.UserID) {
+		h.redirectAdminWithError(w, r, "forbidden_self_sensitive_operation")
+		return
+	}
+	status := strings.TrimSpace(r.FormValue("status"))
+	if status == "" {
+		if r.FormValue("is_active") == "on" || strings.EqualFold(strings.TrimSpace(r.FormValue("is_active")), "true") {
+			status = "active"
+		} else {
+			status = "disabled"
+		}
+	}
+	lastID := ""
+	for _, userID := range userIDs {
+		updated, err := h.userService.UpdateUserStatus(r.Context(), claims, userID, status)
+		if err != nil {
+			h.redirectAdminWithError(w, r, "update_user_status_failed: "+userID+": "+err.Error())
+			return
+		}
+		lastID = updated.User.ID
+	}
+	if len(userIDs) == 1 {
+		h.redirectAdminWithMessage(w, r, "user_status_updated:"+lastID)
+		return
+	}
+	h.redirectAdminWithMessage(w, r, "user_status_updated:"+strconv.Itoa(len(userIDs)))
+}
+
+func (h *handler) adminUserMembershipUpdate(w http.ResponseWriter, r *http.Request) {
+	if h.billing == nil {
+		h.redirectAdminWithError(w, r, "update_user_membership_failed: billing unavailable")
 		return
 	}
 	if err := r.ParseForm(); err != nil {
-		adminRedirect(w, r, "", "invalid_form_data")
+		h.redirectAdminWithError(w, r, "invalid form data")
+		return
+	}
+	userIDs := parseBatchValues(r.FormValue("user_id"))
+	if len(userIDs) == 0 {
+		h.redirectAdminWithError(w, r, "missing user_id")
+		return
+	}
+	planID := strings.ToLower(strings.TrimSpace(r.FormValue("plan_id")))
+	if planID == "" {
+		h.redirectAdminWithError(w, r, "update_user_membership_failed: plan is required")
+		return
+	}
+	periodEndInput := strings.TrimSpace(r.FormValue("period_end"))
+	description := strings.TrimSpace(r.FormValue("description"))
+	var periodEnd time.Time
+	if planID != "free" {
+		if periodEndInput == "" {
+			h.redirectAdminWithError(w, r, "update_user_membership_failed: period_end is required")
+			return
+		}
+		parsed, err := time.ParseInLocation("2006-01-02T15:04", periodEndInput, time.Local)
+		if err != nil {
+			h.redirectAdminWithError(w, r, "update_user_membership_failed: invalid period_end")
+			return
+		}
+		periodEnd = parsed.UTC()
+	}
+
+	lastID := ""
+	for _, userID := range userIDs {
+		if _, err := h.billing.SetMembershipAdmin(r.Context(), userID, billing.AdminSetMembershipRequest{
+			PlanID:      planID,
+			PeriodEnd:   periodEnd,
+			Description: description,
+		}); err != nil {
+			h.redirectAdminWithError(w, r, "update_user_membership_failed: "+userID+": "+err.Error())
+			return
+		}
+		lastID = userID
+	}
+	if len(userIDs) == 1 {
+		h.redirectAdminWithMessage(w, r, "user_membership_updated:"+lastID)
+		return
+	}
+	h.redirectAdminWithMessage(w, r, "user_membership_updated:"+strconv.Itoa(len(userIDs)))
+}
+
+func (h *handler) adminUserDelete(w http.ResponseWriter, r *http.Request) {
+	if h.userService == nil {
+		h.redirectAdminWithError(w, r, "delete_user_failed: user service unavailable")
+		return
+	}
+	claims := SessionClaimsFromContext(r.Context())
+	if err := r.ParseForm(); err != nil {
+		h.redirectAdminWithError(w, r, "invalid form data")
 		return
 	}
 
-	userID := strings.TrimSpace(r.FormValue("user_id"))
-	status := strings.TrimSpace(r.FormValue("status"))
-	updated, err := h.userService.UpdateTenantUserStatus(r.Context(), claims, userID, status)
+	userIDs := parseBatchValues(r.FormValue("user_id"))
+	if len(userIDs) == 0 {
+		h.redirectAdminWithError(w, r, "missing user_id")
+		return
+	}
+	if containsBatchValue(userIDs, claims.UserID) {
+		h.redirectAdminWithError(w, r, "forbidden_delete_self")
+		return
+	}
+	lastID := ""
+	for _, userID := range userIDs {
+		deleted, err := h.userService.DeleteUser(r.Context(), claims, userID)
+		if err != nil {
+			h.redirectAdminWithError(w, r, "delete_user_failed: "+userID+": "+err.Error())
+			return
+		}
+		lastID = deleted.ID
+	}
+	if len(userIDs) == 1 {
+		h.redirectAdminWithMessage(w, r, "user_deleted:"+lastID)
+		return
+	}
+	h.redirectAdminWithMessage(w, r, "user_deleted:"+strconv.Itoa(len(userIDs)))
+}
+
+func (h *handler) adminPromptDelete(w http.ResponseWriter, r *http.Request) {
+	if h.promptAPI == nil {
+		h.redirectAdminWithError(w, r, "delete_prompt_api_failed: prompt api unavailable")
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		h.redirectAdminWithError(w, r, "invalid form data")
+		return
+	}
+
+	slugs := parseBatchValues(r.FormValue("slug"))
+	if len(slugs) == 0 {
+		h.redirectAdminWithError(w, r, "missing slug")
+		return
+	}
+	lastSlug := ""
+	for _, slug := range slugs {
+		if err := h.promptAPI.Delete(r.Context(), slug); err != nil {
+			h.redirectAdminWithError(w, r, "delete_prompt_api_failed: "+slug+": "+err.Error())
+			return
+		}
+		lastSlug = slug
+	}
+	if len(slugs) == 1 {
+		h.redirectAdminWithMessage(w, r, "prompt_api_deleted:"+lastSlug)
+		return
+	}
+	h.redirectAdminWithMessage(w, r, "prompt_api_deleted:"+strconv.Itoa(len(slugs)))
+}
+
+func (h *handler) adminDefaultAPIUpdate(w http.ResponseWriter, r *http.Request) {
+	if h.promptAPI == nil {
+		h.redirectAdminWithError(w, r, "save_default_api_failed: prompt api unavailable")
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		h.redirectAdminWithError(w, r, "invalid form data")
+		return
+	}
+
+	mappings, err := parseDefaultAPIModelMappings(r.FormValue("model_mappings"))
 	if err != nil {
-		adminRedirect(w, r, "", "update_user_status_failed:"+adminUserErrorCode(err))
+		h.redirectAdminWithError(w, r, "save_default_api_failed: "+err.Error())
 		return
 	}
-	if h.audit != nil {
-		_, _ = h.audit.Record(r.Context(), audit.RecordInput{
-			Resource:       "user",
-			Action:         "update_status",
-			ActorUserID:    claims.UserID,
-			ActorTenantID:  claims.TenantID,
-			TargetID:       updated.User.ID,
-			TargetTenantID: claims.TenantID,
-			Metadata: map[string]string{
-				"status": updated.User.Status,
-			},
-		})
+	enabled := r.FormValue("enabled") == "on" || strings.EqualFold(strings.TrimSpace(r.FormValue("enabled")), "true")
+	defaultModel := strings.TrimSpace(r.FormValue("default_model"))
+	allowedModels := uniqueModelTargetsFromMappings(mappings)
+	if defaultModel != "" && !containsText(allowedModels, defaultModel) {
+		allowedModels = append(allowedModels, defaultModel)
 	}
-	adminRedirect(w, r, "user_status_updated:"+updated.User.ID, "")
+	updated, err := h.promptAPI.UpsertDefaultAPI(r.Context(), promptapi.UpsertDefaultAPIRequest{
+		APIKey:          strings.TrimSpace(r.FormValue("api_key")),
+		Enabled:         enabled,
+		DefaultModel:    defaultModel,
+		AllowedModels:   allowedModels,
+		ModelIDMappings: mappings,
+	})
+	if err != nil {
+		h.redirectAdminWithError(w, r, "save_default_api_failed: "+err.Error())
+		return
+	}
+	h.redirectAdminWithMessage(w, r, "default_api_saved:"+updated.APIPath)
 }
 
-func adminSessionAuth(userService *user.Service) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if userService == nil {
-				writeLocalizedPlainError(w, r, http.StatusServiceUnavailable, "user_service_unavailable", "user service unavailable")
-				return
-			}
-
-			token, ok := adminSessionTokenFromRequest(r)
-			if !ok {
-				clearAdminSessionCookie(w)
-				http.Redirect(w, r, "/admin/login?error=sign_in_required", http.StatusSeeOther)
-				return
-			}
-			claims, err := userService.ParseSessionToken(token)
-			if err != nil {
-				clearAdminSessionCookie(w)
-				http.Redirect(w, r, "/admin/login?error=invalid_session", http.StatusSeeOther)
-				return
-			}
-			if _, err := userService.GetMe(r.Context(), claims); err != nil {
-				clearAdminSessionCookie(w)
-				if errors.Is(err, user.ErrUserDisabled) {
-					http.Redirect(w, r, "/admin/login?error=user_disabled", http.StatusSeeOther)
-					return
-				}
-				http.Redirect(w, r, "/admin/login?error=invalid_session", http.StatusSeeOther)
-				return
-			}
-
-			ctx := context.WithValue(r.Context(), sessionKey, claims)
-			next.ServeHTTP(w, r.WithContext(ctx))
-		})
+func (h *handler) adminOrderDelete(w http.ResponseWriter, r *http.Request) {
+	if h.billing == nil {
+		h.redirectAdminWithError(w, r, "delete_order_failed: billing unavailable")
+		return
 	}
+	if err := r.ParseForm(); err != nil {
+		h.redirectAdminWithError(w, r, "invalid form data")
+		return
+	}
+	orderIDs := parseBatchValues(r.FormValue("order_id"))
+	if len(orderIDs) == 0 {
+		h.redirectAdminWithError(w, r, "missing order_id")
+		return
+	}
+	lastID := ""
+	for _, orderID := range orderIDs {
+		deleted, err := h.billing.DeleteOrderAdmin(r.Context(), orderID)
+		if err != nil {
+			h.redirectAdminWithError(w, r, "delete_order_failed: "+orderID+": "+err.Error())
+			return
+		}
+		lastID = deleted.ID
+	}
+	if len(orderIDs) == 1 {
+		h.redirectAdminWithMessage(w, r, "order_deleted:"+lastID)
+		return
+	}
+	h.redirectAdminWithMessage(w, r, "order_deleted:"+strconv.Itoa(len(orderIDs)))
 }
 
-func adminRequireAdminRole() func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			claims := SessionClaimsFromContext(r.Context())
-			if claims.Role != "owner" && claims.Role != "admin" {
-				writeLocalizedPlainError(w, r, http.StatusForbidden, "forbidden", "forbidden")
-				return
-			}
-			next.ServeHTTP(w, r)
-		})
+func (h *handler) redirectAdminWithError(w http.ResponseWriter, r *http.Request, message string) {
+	target := adminReturnTo(r, "/admin/users")
+	sep := "?"
+	if strings.Contains(target, "?") {
+		sep = "&"
 	}
+	http.Redirect(w, r, target+sep+"error="+url.QueryEscape(message), http.StatusSeeOther)
 }
 
-func adminRequireOwnerRole() func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			claims := SessionClaimsFromContext(r.Context())
-			if claims.Role != "owner" {
-				writeLocalizedPlainError(w, r, http.StatusForbidden, "owner_required", "forbidden: owner required")
-				return
-			}
-			next.ServeHTTP(w, r)
-		})
+func (h *handler) redirectAdminWithMessage(w http.ResponseWriter, r *http.Request, message string) {
+	target := adminReturnTo(r, "/admin/users")
+	sep := "?"
+	if strings.Contains(target, "?") {
+		sep = "&"
 	}
+	http.Redirect(w, r, target+sep+"message="+url.QueryEscape(message), http.StatusSeeOther)
+}
+
+func adminReturnTo(r *http.Request, fallback string) string {
+	if r == nil {
+		return fallback
+	}
+	candidates := []string{
+		strings.TrimSpace(r.FormValue("return_to")),
+		strings.TrimSpace(r.URL.Query().Get("return_to")),
+	}
+	for _, c := range candidates {
+		if strings.HasPrefix(c, "/admin") {
+			return c
+		}
+	}
+	return fallback
+}
+
+func (h *handler) hasAdminAccount(ctx context.Context) (bool, error) {
+	if h == nil || h.userService == nil {
+		return false, user.ErrStoreUnavailable
+	}
+	return h.userService.HasAdmin(ctx)
 }
 
 func (h *handler) adminClaimsFromRequest(r *http.Request) (user.SessionClaims, bool) {
-	if h == nil || h.userService == nil {
+	if h == nil || h.userService == nil || r == nil {
 		return user.SessionClaims{}, false
 	}
-	token, ok := adminSessionTokenFromRequest(r)
-	if !ok {
+	cookie, err := r.Cookie(adminSessionCookieName)
+	if err != nil || strings.TrimSpace(cookie.Value) == "" {
 		return user.SessionClaims{}, false
 	}
-	claims, err := h.userService.ParseSessionToken(token)
+	claims, err := h.userService.ValidateSessionToken(cookie.Value)
 	if err != nil {
 		return user.SessionClaims{}, false
 	}
 	return claims, true
 }
 
-func adminSessionTokenFromRequest(r *http.Request) (string, bool) {
-	if cookie, err := r.Cookie(adminSessionCookieName); err == nil {
-		if token := strings.TrimSpace(cookie.Value); token != "" {
-			return token, true
-		}
-	}
-	if token, err := bearerToken(r.Header.Get("Authorization")); err == nil {
-		if strings.TrimSpace(token) != "" {
-			return token, true
-		}
-	}
-	return "", false
-}
-
-func setAdminSessionCookie(w http.ResponseWriter, token string, exp int64) {
-	cookie := &http.Cookie{
+func (h *handler) setAdminSessionCookie(w http.ResponseWriter, token string) {
+	http.SetCookie(w, &http.Cookie{
 		Name:     adminSessionCookieName,
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-	}
-	if exp > 0 {
-		expires := time.Unix(exp, 0)
-		cookie.Expires = expires
-		if maxAge := int(time.Until(expires).Seconds()); maxAge > 0 {
-			cookie.MaxAge = maxAge
-		}
-	}
-	http.SetCookie(w, cookie)
+	})
 }
 
-func clearAdminSessionCookie(w http.ResponseWriter) {
+func (h *handler) clearAdminSessionCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     adminSessionCookieName,
 		Value:    "",
@@ -1196,92 +1686,214 @@ func clearAdminSessionCookie(w http.ResponseWriter) {
 	})
 }
 
-func adminRenderLogin(w http.ResponseWriter, r *http.Request, view adminLoginView) {
-	if strings.TrimSpace(view.Channel) == "" {
-		view.Channel = "phone"
-	}
-	if strings.TrimSpace(view.Lang) == "" {
-		view.Lang = detectLanguage(r)
-	}
-	view.Message = adminFlashMessage(r, view.Message)
-	view.Error = adminErrorMessage(r, view.Error)
-	w.Header().Set("Content-Language", view.Lang)
-	_ = adminLoginTemplate.Execute(w, view)
-}
-
-func adminRedirect(w http.ResponseWriter, r *http.Request, message, errMsg string) {
-	values := make(url.Values)
-	if strings.TrimSpace(message) != "" {
-		values.Set("msg", message)
-	}
-	if strings.TrimSpace(errMsg) != "" {
-		values.Set("error", errMsg)
-	}
-	target := "/admin"
-	if encoded := values.Encode(); encoded != "" {
-		target += "?" + encoded
-	}
-	http.Redirect(w, r, target, http.StatusSeeOther)
-}
-
-func parseCheckbox(v string) bool {
-	v = strings.TrimSpace(strings.ToLower(v))
-	switch v {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
+func adminSessionAuth(userService *user.Service) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if userService == nil {
+				writeLocalizedPlainError(w, r, http.StatusServiceUnavailable, "user_service_unavailable", "user service unavailable")
+				return
+			}
+			cookie, err := r.Cookie(adminSessionCookieName)
+			if err != nil || strings.TrimSpace(cookie.Value) == "" {
+				http.Redirect(w, r, withQuery(withLangPath("/admin/login", detectLanguage(r)), "error", "sign_in_required"), http.StatusSeeOther)
+				return
+			}
+			claims, err := userService.ValidateSessionToken(cookie.Value)
+			if err != nil {
+				http.Redirect(w, r, withQuery(withLangPath("/admin/login", detectLanguage(r)), "error", "invalid_session"), http.StatusSeeOther)
+				return
+			}
+			ctx := context.WithValue(r.Context(), sessionKey, claims)
+			ctx = context.WithValue(ctx, sessionToken, cookie.Value)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
 	}
 }
 
-func parseOptionalPositiveInt(raw string) (*int, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil, nil
+func adminRequireAdminRole() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			claims := SessionClaimsFromContext(r.Context())
+			if claims.Role != "admin" {
+				writeLocalizedPlainError(w, r, http.StatusForbidden, "forbidden", "forbidden")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
 	}
-	v, err := strconv.Atoi(raw)
-	if err != nil || v <= 0 {
-		return nil, errors.New("invalid int")
-	}
-	return &v, nil
 }
 
-func splitVariables(raw string) []string {
-	raw = strings.ReplaceAll(raw, "\n", ",")
+func adminRequireOwnerRole() func(http.Handler) http.Handler {
+	return adminRequireAdminRole()
+}
+
+func splitCommaSeparated(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
 	parts := strings.Split(raw, ",")
 	out := make([]string, 0, len(parts))
-	seen := map[string]struct{}{}
-	for _, part := range parts {
-		v := strings.TrimSpace(part)
+	for _, p := range parts {
+		v := strings.TrimSpace(p)
 		if v == "" {
 			continue
 		}
-		if _, ok := seen[v]; ok {
-			continue
-		}
-		seen[v] = struct{}{}
 		out = append(out, v)
 	}
 	return out
 }
 
-func adminUserErrorCode(err error) string {
-	switch {
-	case errors.Is(err, user.ErrInvalidChannel), errors.Is(err, user.ErrInvalidIdentifier), errors.Is(err, user.ErrInvalidVerifyCode), errors.Is(err, user.ErrInvalidRole), errors.Is(err, user.ErrInvalidStatus):
-		return "invalid_auth_request"
-	case errors.Is(err, user.ErrUserExists):
-		return "user_exists_try_signin"
-	case errors.Is(err, user.ErrUserNotFound):
-		return "user_not_found_try_signup"
-	case errors.Is(err, user.ErrUserDisabled):
-		return "user_disabled"
-	case errors.Is(err, user.ErrTenantNotFound):
-		return "tenant_not_found"
-	case errors.Is(err, user.ErrSessionTokenInvalid), errors.Is(err, user.ErrSessionTokenExpired):
-		return "session_invalid_or_expired"
-	case errors.Is(err, user.ErrForbidden), strings.Contains(err.Error(), "forbidden"):
-		return "permission_denied"
-	default:
-		return "internal_error"
+func parseDefaultAPIModelMappings(raw string) ([]promptapi.DefaultAPIModelMapping, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
 	}
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == '\n' || r == '\r' || r == ';'
+	})
+	out := make([]promptapi.DefaultAPIModelMapping, 0, len(parts))
+	for _, part := range parts {
+		line := strings.TrimSpace(part)
+		if line == "" {
+			continue
+		}
+		pair := strings.SplitN(line, "=>", 2)
+		if len(pair) != 2 {
+			pair = strings.SplitN(line, "=", 2)
+		}
+		if len(pair) != 2 {
+			return nil, errors.New("invalid model mapping line")
+		}
+		modelID := strings.TrimSpace(pair[0])
+		model := strings.TrimSpace(pair[1])
+		if modelID == "" || model == "" {
+			return nil, errors.New("invalid model mapping line")
+		}
+		out = append(out, promptapi.DefaultAPIModelMapping{ModelID: modelID, Model: model})
+	}
+	return out, nil
+}
+
+func uniqueModelTargetsFromMappings(items []promptapi.DefaultAPIModelMapping) []string {
+	if len(items) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(items))
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		target := strings.TrimSpace(item.Model)
+		if target == "" {
+			continue
+		}
+		if _, ok := seen[target]; ok {
+			continue
+		}
+		seen[target] = struct{}{}
+		out = append(out, target)
+	}
+	return out
+}
+
+func containsText(items []string, target string) bool {
+	target = strings.TrimSpace(target)
+	for _, item := range items {
+		if strings.TrimSpace(item) == target {
+			return true
+		}
+	}
+	return false
+}
+
+func containsBatchValue(items []string, target string) bool {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return false
+	}
+	for _, item := range items {
+		if strings.TrimSpace(item) == target {
+			return true
+		}
+	}
+	return false
+}
+
+func buildPromptUpsertRequestFromForm(r *http.Request) promptapi.UpsertRequest {
+	variables := splitCommaSeparated(r.FormValue("variables"))
+	inputKey := sanitizePromptVarName(r.FormValue("input_key"))
+	if inputKey == "" {
+		inputKey = "input"
+	}
+	if len(variables) == 0 {
+		variables = []string{inputKey}
+	}
+	systemPrompt := strings.TrimSpace(r.FormValue("system_prompt"))
+	if systemPrompt == "" {
+		systemPrompt = strings.TrimSpace(r.FormValue("task_instruction"))
+	}
+	userTemplate := strings.TrimSpace(r.FormValue("user_template"))
+	if userTemplate == "" {
+		userTemplate = "{{." + inputKey + "}}"
+	}
+	return promptapi.UpsertRequest{
+		Slug:          strings.TrimSpace(r.FormValue("slug")),
+		Name:          strings.TrimSpace(r.FormValue("name")),
+		Description:   strings.TrimSpace(r.FormValue("description")),
+		Model:         strings.TrimSpace(r.FormValue("model")),
+		InputSchema:   strings.TrimSpace(r.FormValue("input_schema")),
+		OutputSchema:  strings.TrimSpace(r.FormValue("output_schema")),
+		SystemPrompt:  systemPrompt,
+		UserTemplate:  userTemplate,
+		Variables:     variables,
+		ExampleInput:  strings.TrimSpace(r.FormValue("example_input")),
+		ExampleOutput: strings.TrimSpace(r.FormValue("example_output")),
+		Publish:       r.FormValue("publish") == "on",
+	}
+}
+
+func sanitizePromptVarName(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, ch := range raw {
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' {
+			b.WriteRune(ch)
+			continue
+		}
+		if ch == '-' || ch == ' ' {
+			b.WriteRune('_')
+		}
+	}
+	return strings.Trim(b.String(), "_")
+}
+
+func parsePromptPreviewInput(raw string, variables []string) (map[string]any, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		fallback := make(map[string]any, len(variables))
+		for _, v := range variables {
+			key := strings.TrimSpace(v)
+			if key == "" {
+				continue
+			}
+			fallback[key] = "demo_" + key
+		}
+		return fallback, nil
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return nil, err
+	}
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	return payload, nil
+}
+
+func adminErrorCode(err error) string {
+	if err == nil {
+		return ""
+	}
+	return fmt.Sprintf("error: %s", err.Error())
 }

@@ -9,27 +9,26 @@ import (
 	"github.com/derekwin/opcAPI/internal/audit"
 	"github.com/derekwin/opcAPI/internal/auth"
 	"github.com/derekwin/opcAPI/internal/billing"
-	"github.com/derekwin/opcAPI/internal/keymgmt"
 	"github.com/derekwin/opcAPI/internal/promptapi"
 	"github.com/derekwin/opcAPI/internal/provider"
 	"github.com/derekwin/opcAPI/internal/quota"
+	"github.com/derekwin/opcAPI/internal/upstream"
 	"github.com/derekwin/opcAPI/internal/user"
 )
 
 type handler struct {
-	logger                *slog.Logger
-	gateway               provider.Gateway
-	authManager           *auth.Manager
-	requireTenantBoundKey bool
-	limiter               *quota.Limiter
-	policySync            *keymgmt.PolicySyncer
-	userService           *user.Service
-	billing               *billing.Service
-	promptAPI             *promptapi.Service
-	audit                 *audit.Service
+	logger      *slog.Logger
+	gateway     provider.Gateway
+	authManager *auth.Manager
+	limiter     *quota.Limiter
+	userService *user.Service
+	billing     *billing.Service
+	promptAPI   *promptapi.Service
+	upstream    *upstream.Service
+	audit       *audit.Service
 }
 
-func NewRouter(logger *slog.Logger, gateway provider.Gateway, authManager *auth.Manager, requireTenantBoundKey bool, limiter *quota.Limiter, policySyncer *keymgmt.PolicySyncer, userService *user.Service, billingService *billing.Service, promptService *promptapi.Service, auditService *audit.Service) http.Handler {
+func NewRouter(logger *slog.Logger, gateway provider.Gateway, authManager *auth.Manager, limiter *quota.Limiter, userService *user.Service, billingService *billing.Service, promptService *promptapi.Service, upstreamService *upstream.Service, auditService *audit.Service) http.Handler {
 	if gateway == nil {
 		gateway = provider.NewStubGateway()
 	}
@@ -40,16 +39,15 @@ func NewRouter(logger *slog.Logger, gateway provider.Gateway, authManager *auth.
 		limiter = quota.NewLimiter(0, 0)
 	}
 	h := &handler{
-		logger:                logger,
-		gateway:               gateway,
-		authManager:           authManager,
-		requireTenantBoundKey: requireTenantBoundKey,
-		limiter:               limiter,
-		policySync:            policySyncer,
-		userService:           userService,
-		billing:               billingService,
-		promptAPI:             promptService,
-		audit:                 auditService,
+		logger:      logger,
+		gateway:     gateway,
+		authManager: authManager,
+		limiter:     limiter,
+		userService: userService,
+		billing:     billingService,
+		promptAPI:   promptService,
+		upstream:    upstreamService,
+		audit:       auditService,
 	}
 
 	mux := http.NewServeMux()
@@ -58,22 +56,41 @@ func NewRouter(logger *slog.Logger, gateway provider.Gateway, authManager *auth.
 		http.MethodGet:  http.HandlerFunc(h.adminLoginPage),
 		http.MethodPost: http.HandlerFunc(h.adminLoginSubmit),
 	}))
+	mux.Handle("/admin/setup", methodHandlers(map[string]http.Handler{
+		http.MethodGet:  http.HandlerFunc(h.adminSetupPage),
+		http.MethodPost: http.HandlerFunc(h.adminSetupSubmit),
+	}))
 	mux.Handle("/admin/logout", methodHandlers(map[string]http.Handler{
 		http.MethodGet:  http.HandlerFunc(h.adminLogout),
 		http.MethodPost: http.HandlerFunc(h.adminLogout),
 	}))
 	mux.Handle("/admin", chain(
-		methodHandler(http.MethodGet, http.HandlerFunc(h.adminDashboard)),
+		methodHandler(http.MethodGet, http.HandlerFunc(h.adminHome)),
 		adminSessionAuth(h.userService),
 		adminRequireAdminRole(),
 	))
-	mux.Handle("/admin/keys/new", chain(
-		methodHandler(http.MethodPost, http.HandlerFunc(h.adminKeyCreate)),
+	mux.Handle("/admin/users", chain(
+		methodHandler(http.MethodGet, http.HandlerFunc(h.adminUsersPage)),
 		adminSessionAuth(h.userService),
 		adminRequireAdminRole(),
 	))
-	mux.Handle("/admin/keys/delete", chain(
-		methodHandler(http.MethodPost, http.HandlerFunc(h.adminKeyDelete)),
+	mux.Handle("/admin/prompts", chain(
+		methodHandler(http.MethodGet, http.HandlerFunc(h.adminPromptsPage)),
+		adminSessionAuth(h.userService),
+		adminRequireAdminRole(),
+	))
+	mux.Handle("/admin/orders", chain(
+		methodHandler(http.MethodGet, http.HandlerFunc(h.adminOrdersPage)),
+		adminSessionAuth(h.userService),
+		adminRequireAdminRole(),
+	))
+	mux.Handle("/admin/upstreams", chain(
+		methodHandler(http.MethodGet, http.HandlerFunc(h.adminUpstreamsPage)),
+		adminSessionAuth(h.userService),
+		adminRequireAdminRole(),
+	))
+	mux.Handle("/admin/routes", chain(
+		methodHandler(http.MethodGet, http.HandlerFunc(h.adminUpstreamsPage)),
 		adminSessionAuth(h.userService),
 		adminRequireAdminRole(),
 	))
@@ -82,47 +99,102 @@ func NewRouter(logger *slog.Logger, gateway provider.Gateway, authManager *auth.
 		adminSessionAuth(h.userService),
 		adminRequireAdminRole(),
 	))
-	mux.Handle("/admin/billing/topup", chain(
-		methodHandler(http.MethodPost, http.HandlerFunc(h.adminBillingTopup)),
+	mux.Handle("/admin/prompt-apis/preview", chain(
+		methodHandler(http.MethodPost, http.HandlerFunc(h.adminPromptPreview)),
+		adminSessionAuth(h.userService),
+		adminRequireAdminRole(),
+	))
+	mux.Handle("/admin/prompt-apis/delete", chain(
+		methodHandler(http.MethodPost, http.HandlerFunc(h.adminPromptDelete)),
+		adminSessionAuth(h.userService),
+		adminRequireAdminRole(),
+	))
+	mux.Handle("/admin/default-apis/update", chain(
+		methodHandler(http.MethodPost, http.HandlerFunc(h.adminDefaultAPIUpdate)),
+		adminSessionAuth(h.userService),
+		adminRequireAdminRole(),
+	))
+	mux.Handle("/admin/billing/plans", chain(
+		methodHandler(http.MethodPost, http.HandlerFunc(h.adminBillingPlansUpdate)),
 		adminSessionAuth(h.userService),
 		adminRequireAdminRole(),
 	))
 	mux.Handle("/admin/users/new", chain(
 		methodHandler(http.MethodPost, http.HandlerFunc(h.adminUserCreate)),
 		adminSessionAuth(h.userService),
-		adminRequireOwnerRole(),
+		adminRequireAdminRole(),
 	))
 	mux.Handle("/admin/users/role", chain(
 		methodHandler(http.MethodPost, http.HandlerFunc(h.adminUserRoleUpdate)),
 		adminSessionAuth(h.userService),
-		adminRequireOwnerRole(),
+		adminRequireAdminRole(),
 	))
 	mux.Handle("/admin/users/status", chain(
 		methodHandler(http.MethodPost, http.HandlerFunc(h.adminUserStatusUpdate)),
 		adminSessionAuth(h.userService),
-		adminRequireOwnerRole(),
+		adminRequireAdminRole(),
 	))
-	mux.Handle("/v1/auth/signup", methodHandler(http.MethodPost, http.HandlerFunc(h.authSignup)))
-	mux.Handle("/v1/auth/signin", methodHandler(http.MethodPost, http.HandlerFunc(h.authSignin)))
-	mux.Handle("/v1/auth/me", methodHandler(http.MethodGet, chain(
+	mux.Handle("/admin/users/membership", chain(
+		methodHandler(http.MethodPost, http.HandlerFunc(h.adminUserMembershipUpdate)),
+		adminSessionAuth(h.userService),
+		adminRequireAdminRole(),
+	))
+	mux.Handle("/admin/users/delete", chain(
+		methodHandler(http.MethodPost, http.HandlerFunc(h.adminUserDelete)),
+		adminSessionAuth(h.userService),
+		adminRequireAdminRole(),
+	))
+	mux.Handle("/admin/orders/delete", chain(
+		methodHandler(http.MethodPost, http.HandlerFunc(h.adminOrderDelete)),
+		adminSessionAuth(h.userService),
+		adminRequireAdminRole(),
+	))
+	mux.Handle("/admin/upstreams/new", chain(
+		methodHandler(http.MethodPost, http.HandlerFunc(h.adminUpstreamCreate)),
+		adminSessionAuth(h.userService),
+		adminRequireAdminRole(),
+	))
+	mux.Handle("/admin/upstreams/delete", chain(
+		methodHandler(http.MethodPost, http.HandlerFunc(h.adminUpstreamDelete)),
+		adminSessionAuth(h.userService),
+		adminRequireAdminRole(),
+	))
+	mux.Handle("/admin/upstreams/diagnose", chain(
+		methodHandler(http.MethodPost, http.HandlerFunc(h.adminUpstreamDiagnose)),
+		adminSessionAuth(h.userService),
+		adminRequireAdminRole(),
+	))
+	mux.Handle("/admin/upstreams/toggle", chain(
+		methodHandler(http.MethodPost, http.HandlerFunc(h.adminUpstreamToggleSubmit)),
+		adminSessionAuth(h.userService),
+		adminRequireAdminRole(),
+	))
+	mux.Handle("/admin/routes/new", chain(
+		methodHandler(http.MethodPost, http.HandlerFunc(h.adminRouteCreate)),
+		adminSessionAuth(h.userService),
+		adminRequireAdminRole(),
+	))
+	mux.Handle("/admin/routes/delete", chain(
+		methodHandler(http.MethodPost, http.HandlerFunc(h.adminRouteDelete)),
+		adminSessionAuth(h.userService),
+		adminRequireAdminRole(),
+	))
+	mux.Handle("/api/auth/signup", methodHandler(http.MethodPost, http.HandlerFunc(h.authSignup)))
+	mux.Handle("/api/auth/signin", methodHandler(http.MethodPost, http.HandlerFunc(h.authSignin)))
+	mux.Handle("/api/auth/me", methodHandler(http.MethodGet, chain(
 		http.HandlerFunc(h.authMe),
 		sessionAuth(h.userService),
 	)))
-	mux.Handle("/v1/admin/users", methodHandler(http.MethodGet, chain(
+	mux.Handle("/api/auth/logout", methodHandler(http.MethodPost, chain(
+		http.HandlerFunc(h.authLogout),
+		sessionAuth(h.userService),
+	)))
+	mux.Handle("/api/admin/users", methodHandler(http.MethodGet, chain(
 		http.HandlerFunc(h.adminUsers),
 		sessionAuth(h.userService),
 		requireAdminRole(),
 	)))
-	mux.Handle("/v1/admin/keys", chain(
-		methodHandlers(map[string]http.Handler{
-			http.MethodGet:    http.HandlerFunc(h.adminKeysList),
-			http.MethodPost:   http.HandlerFunc(h.adminKeysUpsert),
-			http.MethodDelete: http.HandlerFunc(h.adminKeysDelete),
-		}),
-		sessionAuth(h.userService),
-		requireAdminRole(),
-	))
-	mux.Handle("/v1/admin/prompt-apis", chain(
+	mux.Handle("/api/admin/prompt-apis", chain(
 		methodHandlers(map[string]http.Handler{
 			http.MethodGet:  http.HandlerFunc(h.adminPromptAPIList),
 			http.MethodPost: http.HandlerFunc(h.adminPromptAPIUpsert),
@@ -130,42 +202,77 @@ func NewRouter(logger *slog.Logger, gateway provider.Gateway, authManager *auth.
 		sessionAuth(h.userService),
 		requireAdminRole(),
 	))
-	mux.Handle("/v1/admin/audit/logs", methodHandler(http.MethodGet, chain(
+	mux.Handle("/api/admin/default-apis", chain(
+		methodHandlers(map[string]http.Handler{
+			http.MethodGet:  http.HandlerFunc(h.adminDefaultAPIList),
+			http.MethodPost: http.HandlerFunc(h.adminDefaultAPIUpsert),
+		}),
+		sessionAuth(h.userService),
+		requireAdminRole(),
+	))
+	mux.Handle("/api/admin/audit/logs", methodHandler(http.MethodGet, chain(
 		http.HandlerFunc(h.adminAuditLogs),
 		sessionAuth(h.userService),
 		requireAdminRole(),
 	)))
-	mux.Handle("/v1/billing/balance", methodHandler(http.MethodGet, chain(
+	mux.Handle("/api/billing/balance", methodHandler(http.MethodGet, chain(
 		http.HandlerFunc(h.billingBalance),
 		sessionAuth(h.userService),
 	)))
-	mux.Handle("/v1/billing/topup", methodHandler(http.MethodPost, chain(
-		http.HandlerFunc(h.billingTopup),
-		sessionAuth(h.userService),
-	)))
-	mux.Handle("/v1/billing/subscribe", methodHandler(http.MethodPost, chain(
+	mux.Handle("/api/billing/subscribe", methodHandler(http.MethodPost, chain(
 		http.HandlerFunc(h.billingSubscribe),
 		sessionAuth(h.userService),
 	)))
-	mux.Handle("/v1/admin/billing/orders", methodHandler(http.MethodGet, chain(
+	mux.Handle("/api/admin/billing/orders", methodHandler(http.MethodGet, chain(
 		http.HandlerFunc(h.adminBillingOrders),
+		sessionAuth(h.userService),
+		requireAdminRole(),
+	)))
+	mux.Handle("/api/admin/upstreams", chain(
+		methodHandlers(map[string]http.Handler{
+			http.MethodGet:    http.HandlerFunc(h.adminUpstreamsList),
+			http.MethodPost:   http.HandlerFunc(h.adminUpstreamsUpsert),
+			http.MethodDelete: http.HandlerFunc(h.adminUpstreamsDelete),
+		}),
+		sessionAuth(h.userService),
+		requireAdminRole(),
+	))
+	mux.Handle("/api/admin/upstreams/diagnose", methodHandler(http.MethodPost, chain(
+		http.HandlerFunc(h.adminUpstreamsDiagnose),
+		sessionAuth(h.userService),
+		requireAdminRole(),
+	)))
+	mux.Handle("/api/admin/routes", chain(
+		methodHandlers(map[string]http.Handler{
+			http.MethodGet:    http.HandlerFunc(h.adminRoutesList),
+			http.MethodPost:   http.HandlerFunc(h.adminRoutesUpsert),
+			http.MethodDelete: http.HandlerFunc(h.adminRoutesDelete),
+		}),
+		sessionAuth(h.userService),
+		requireAdminRole(),
+	))
+	mux.Handle("/api/admin/routes/runtime-stats", methodHandler(http.MethodGet, chain(
+		http.HandlerFunc(h.adminRoutesRuntimeStats),
 		sessionAuth(h.userService),
 		requireAdminRole(),
 	)))
 
 	mux.Handle("/v1/models", methodHandler(http.MethodGet, chain(
 		http.HandlerFunc(h.models),
-		apiKeyAuth(h.authManager),
+		sessionAuth(h.userService),
+		membershipQuotaPolicy(h.billing, h.limiter),
 		requestQuota(h.limiter),
 	)))
 	mux.Handle("/v1/chat/completions", methodHandler(http.MethodPost, chain(
 		http.HandlerFunc(h.chatCompletions),
-		apiKeyAuth(h.authManager),
+		sessionAuth(h.userService),
+		membershipQuotaPolicy(h.billing, h.limiter),
 		requestQuota(h.limiter),
 	)))
 	mux.Handle("/v1/prompt-apis/", chain(
 		http.HandlerFunc(h.promptAPIInvoke),
-		apiKeyAuth(h.authManager),
+		sessionAuth(h.userService),
+		membershipQuotaPolicy(h.billing, h.limiter),
 		requestQuota(h.limiter),
 	))
 

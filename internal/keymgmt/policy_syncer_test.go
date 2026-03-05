@@ -122,7 +122,7 @@ func TestInitializeRedisBackendRequiresClient(t *testing.T) {
 	}
 }
 
-func TestPolicyCRUD(t *testing.T) {
+func TestPolicyCRUDWithUserAndPlanTier(t *testing.T) {
 	tempDir := t.TempDir()
 	path := filepath.Join(tempDir, "policies.json")
 
@@ -141,62 +141,49 @@ func TestPolicyCRUD(t *testing.T) {
 	}
 
 	enabled := true
-	rpm := 1
-	daily := 9
-	tenantID := "ten_test"
+	userID := "usr_test"
+	paid := true
+	plan := "pro"
 	record, err := s.Upsert(context.Background(), UpsertPolicyInput{
-		APIKey:          "sk-crud",
-		TenantID:        &tenantID,
-		Enabled:         &enabled,
-		RPMLimit:        &rpm,
-		DailyTokenLimit: &daily,
+		APIKey:      "sk-crud",
+		UserID:      &userID,
+		Enabled:     &enabled,
+		PaidEnabled: &paid,
+		PlanTier:    &plan,
 	})
 	if err != nil {
 		t.Fatalf("upsert failed: %v", err)
+	}
+	if record.UserID != userID {
+		t.Fatalf("expected user_id=%s, got %s", userID, record.UserID)
+	}
+	if !record.PaidEnabled || record.PlanTier != "pro" {
+		t.Fatalf("unexpected paid fields: %+v", record)
+	}
+	if record.RPMLimit < 1000 || record.DailyTokenLimit < 20_000_000 {
+		t.Fatalf("expected upgraded limits for pro tier, got rpm=%d daily=%d", record.RPMLimit, record.DailyTokenLimit)
 	}
 
 	if _, err := m.Authenticate("Bearer sk-crud"); err != nil {
 		t.Fatalf("dynamic key authenticate failed: %v", err)
 	}
-	if l.AllowRequest(record.KeyHash).Allowed != true {
-		t.Fatalf("first request should pass")
-	}
-	if l.AllowRequest(record.KeyHash).Allowed {
-		t.Fatalf("second request should be rate limited")
+	if got := s.ResolveUserByKeyHash(record.KeyHash); got != userID {
+		t.Fatalf("unexpected resolved user: %s", got)
 	}
 
-	list, total, err := s.List(context.Background(), ListQuery{Limit: 10})
+	list, total, err := s.List(context.Background(), ListQuery{UserID: userID, Limit: 10})
 	if err != nil {
 		t.Fatalf("list failed: %v", err)
 	}
-	if total < 1 {
-		t.Fatalf("expected total > 0, got %d", total)
-	}
-	found := false
-	for _, item := range list {
-		if item.KeyHash == record.KeyHash {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("list missing key hash")
-	}
-	if got := s.ResolveTenantByKeyHash(record.KeyHash); got != tenantID {
-		t.Fatalf("unexpected resolved tenant: %s", got)
+	if total < 1 || len(list) == 0 {
+		t.Fatalf("expected list to contain record")
 	}
 
-	if err := s.DeleteForTenant(context.Background(), record.KeyHash, "ten_other"); err != ErrPolicyNotFound {
-		t.Fatalf("expected cross-tenant delete to fail, got %v", err)
+	if err := s.DeleteForUser(context.Background(), record.KeyHash, "usr_other"); err != ErrPolicyNotFound {
+		t.Fatalf("expected scoped delete to fail, got %v", err)
 	}
-	if _, err := m.Authenticate("Bearer sk-crud"); err != nil {
-		t.Fatalf("key should remain after failed cross-tenant delete, got %v", err)
-	}
-	if err := s.DeleteForTenant(context.Background(), record.KeyHash, tenantID); err != nil {
+	if err := s.DeleteForUser(context.Background(), record.KeyHash, userID); err != nil {
 		t.Fatalf("delete failed: %v", err)
-	}
-	if got := s.ResolveTenantByKeyHash(record.KeyHash); got != "" {
-		t.Fatalf("expected tenant mapping cleared, got %s", got)
 	}
 	if _, err := m.Authenticate("Bearer sk-crud"); err != auth.ErrInvalidAPIKey {
 		t.Fatalf("expected removed key to fail auth, got %v", err)

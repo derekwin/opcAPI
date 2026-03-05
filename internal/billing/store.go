@@ -15,6 +15,7 @@ type dataset struct {
 	Balances      []Balance      `json:"balances"`
 	Orders        []Order        `json:"orders"`
 	Subscriptions []Subscription `json:"subscriptions"`
+	PlanConfigs   []PlanConfig   `json:"plan_configs,omitempty"`
 }
 
 type FileStore struct {
@@ -33,7 +34,7 @@ func NewFileStore(path string) (*FileStore, error) {
 	return s, nil
 }
 
-func (s *FileStore) GetOrCreateBalance(tenantID, currency string) (Balance, error) {
+func (s *FileStore) GetOrCreateBalance(userID, currency string) (Balance, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -43,12 +44,26 @@ func (s *FileStore) GetOrCreateBalance(tenantID, currency string) (Balance, erro
 	}
 
 	for _, b := range ds.Balances {
-		if b.TenantID == tenantID {
+		if normalizeSubjectID(b.UserID, b.TenantID) == userID {
+			b.UserID = normalizeSubjectID(b.UserID, b.TenantID)
+			if target := strings.TrimSpace(currency); target != "" && b.Currency != target {
+				b.Currency = target
+				b.UpdatedAt = time.Now().UTC()
+				for i := range ds.Balances {
+					if normalizeSubjectID(ds.Balances[i].UserID, ds.Balances[i].TenantID) == userID {
+						ds.Balances[i] = b
+						break
+					}
+				}
+				if err := s.saveLocked(ds); err != nil {
+					return Balance{}, err
+				}
+			}
 			return b, nil
 		}
 	}
 
-	bal := Balance{TenantID: tenantID, Amount: 0, Currency: currency, UpdatedAt: time.Now().UTC()}
+	bal := Balance{UserID: userID, Amount: 0, Currency: currency, UpdatedAt: time.Now().UTC()}
 	ds.Balances = append(ds.Balances, bal)
 	if err := s.saveLocked(ds); err != nil {
 		return Balance{}, err
@@ -56,7 +71,7 @@ func (s *FileStore) GetOrCreateBalance(tenantID, currency string) (Balance, erro
 	return bal, nil
 }
 
-func (s *FileStore) AddBalance(tenantID string, amount float64, currency string) (Balance, error) {
+func (s *FileStore) AddBalance(userID string, amount float64, currency string) (Balance, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -66,7 +81,8 @@ func (s *FileStore) AddBalance(tenantID string, amount float64, currency string)
 	}
 
 	for i, b := range ds.Balances {
-		if b.TenantID == tenantID {
+		if normalizeSubjectID(b.UserID, b.TenantID) == userID {
+			b.UserID = userID
 			b.Amount += amount
 			b.Currency = currency
 			b.UpdatedAt = time.Now().UTC()
@@ -78,7 +94,7 @@ func (s *FileStore) AddBalance(tenantID string, amount float64, currency string)
 		}
 	}
 
-	b := Balance{TenantID: tenantID, Amount: amount, Currency: currency, UpdatedAt: time.Now().UTC()}
+	b := Balance{UserID: userID, Amount: amount, Currency: currency, UpdatedAt: time.Now().UTC()}
 	ds.Balances = append(ds.Balances, b)
 	if err := s.saveLocked(ds); err != nil {
 		return Balance{}, err
@@ -86,7 +102,7 @@ func (s *FileStore) AddBalance(tenantID string, amount float64, currency string)
 	return b, nil
 }
 
-func (s *FileStore) DeductBalance(tenantID string, amount float64, currency string) (Balance, error) {
+func (s *FileStore) DeductBalance(userID string, amount float64, currency string) (Balance, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -100,7 +116,7 @@ func (s *FileStore) DeductBalance(tenantID string, amount float64, currency stri
 	}
 
 	for i, b := range ds.Balances {
-		if b.TenantID != tenantID {
+		if normalizeSubjectID(b.UserID, b.TenantID) != userID {
 			continue
 		}
 		if b.Currency != "" && currency != "" && b.Currency != currency {
@@ -110,6 +126,7 @@ func (s *FileStore) DeductBalance(tenantID string, amount float64, currency stri
 			return Balance{}, ErrInsufficientBalance
 		}
 
+		b.UserID = userID
 		b.Amount -= amount
 		if b.Amount < 0 && b.Amount > -1e-9 {
 			b.Amount = 0
@@ -156,8 +173,91 @@ func (s *FileStore) CreateSubscription(sub Subscription) (Subscription, error) {
 	return sub, nil
 }
 
-func (s *FileStore) ListOrders(tenantID string, limit int) ([]Order, error) {
-	orders, _, err := s.QueryOrders(OrderQuery{TenantID: tenantID, Limit: limit})
+func (s *FileStore) ListSubscriptions() ([]Subscription, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ds, err := s.loadLocked()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Subscription, 0, len(ds.Subscriptions))
+	for _, sub := range ds.Subscriptions {
+		sub.UserID = normalizeSubjectID(sub.UserID, sub.TenantID)
+		out = append(out, sub)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
+func (s *FileStore) ListPlanConfigs() ([]PlanConfig, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ds, err := s.loadLocked()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]PlanConfig, 0, len(ds.PlanConfigs))
+	for _, cfg := range ds.PlanConfigs {
+		cfg.PlanID = strings.ToLower(strings.TrimSpace(cfg.PlanID))
+		if cfg.PlanID == "" {
+			continue
+		}
+		out = append(out, cfg)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].PlanID == out[j].PlanID {
+			return out[i].UpdatedAt.After(out[j].UpdatedAt)
+		}
+		return out[i].PlanID < out[j].PlanID
+	})
+	return out, nil
+}
+
+func (s *FileStore) SavePlanConfigs(configs []PlanConfig) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ds, err := s.loadLocked()
+	if err != nil {
+		return err
+	}
+	ds.PlanConfigs = make([]PlanConfig, 0, len(configs))
+	for _, cfg := range configs {
+		cfg.PlanID = strings.ToLower(strings.TrimSpace(cfg.PlanID))
+		if cfg.PlanID == "" {
+			continue
+		}
+		ds.PlanConfigs = append(ds.PlanConfigs, cfg)
+	}
+	return s.saveLocked(ds)
+}
+
+func (s *FileStore) ListBalances() ([]Balance, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ds, err := s.loadLocked()
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]Balance, 0, len(ds.Balances))
+	for _, b := range ds.Balances {
+		b.UserID = normalizeSubjectID(b.UserID, b.TenantID)
+		out = append(out, b)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].UpdatedAt.After(out[j].UpdatedAt)
+	})
+	return out, nil
+}
+
+func (s *FileStore) ListOrders(userID string, limit int) ([]Order, error) {
+	orders, _, err := s.QueryOrders(OrderQuery{UserID: userID, Limit: limit})
 	return orders, err
 }
 
@@ -171,15 +271,24 @@ func (s *FileStore) QueryOrders(query OrderQuery) ([]Order, int, error) {
 	}
 
 	orders := make([]Order, 0)
-	tenantID := strings.TrimSpace(query.TenantID)
+	orderID := strings.TrimSpace(query.ID)
+	userID := strings.TrimSpace(query.UserID)
+	if userID == "" {
+		userID = strings.TrimSpace(query.TenantID)
+	}
 	orderType := strings.ToLower(strings.TrimSpace(query.Type))
 	status := strings.ToLower(strings.TrimSpace(query.Status))
 	channel := strings.ToLower(strings.TrimSpace(query.Channel))
 
 	for _, o := range ds.Orders {
-		if tenantID != "" && o.TenantID != tenantID {
+		if orderID != "" && o.ID != orderID {
 			continue
 		}
+		subjectID := normalizeSubjectID(o.UserID, o.TenantID)
+		if userID != "" && subjectID != userID {
+			continue
+		}
+		o.UserID = subjectID
 		if orderType != "" && strings.ToLower(o.Type) != orderType {
 			continue
 		}
@@ -217,6 +326,38 @@ func (s *FileStore) QueryOrders(query OrderQuery) ([]Order, int, error) {
 	return orders[offset:end], total, nil
 }
 
+func (s *FileStore) DeleteOrder(orderID string) (Order, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ds, err := s.loadLocked()
+	if err != nil {
+		return Order{}, err
+	}
+	orderID = strings.TrimSpace(orderID)
+	if orderID == "" {
+		return Order{}, ErrOrderNotFound
+	}
+
+	idx := -1
+	var deleted Order
+	for i := range ds.Orders {
+		if ds.Orders[i].ID == orderID {
+			idx = i
+			deleted = ds.Orders[i]
+			break
+		}
+	}
+	if idx < 0 {
+		return Order{}, ErrOrderNotFound
+	}
+	ds.Orders = append(ds.Orders[:idx], ds.Orders[idx+1:]...)
+	if err := s.saveLocked(ds); err != nil {
+		return Order{}, err
+	}
+	return deleted, nil
+}
+
 func (s *FileStore) ensureFile() error {
 	dir := filepath.Dir(s.path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -228,7 +369,7 @@ func (s *FileStore) ensureFile() error {
 		return err
 	}
 
-	empty := dataset{Balances: []Balance{}, Orders: []Order{}, Subscriptions: []Subscription{}}
+	empty := dataset{Balances: []Balance{}, Orders: []Order{}, Subscriptions: []Subscription{}, PlanConfigs: []PlanConfig{}}
 	b, err := json.MarshalIndent(empty, "", "  ")
 	if err != nil {
 		return err
@@ -243,7 +384,7 @@ func (s *FileStore) loadLocked() (dataset, error) {
 		return dataset{}, err
 	}
 	if len(b) == 0 {
-		return dataset{Balances: []Balance{}, Orders: []Order{}, Subscriptions: []Subscription{}}, nil
+		return dataset{Balances: []Balance{}, Orders: []Order{}, Subscriptions: []Subscription{}, PlanConfigs: []PlanConfig{}}, nil
 	}
 
 	var ds dataset
@@ -258,6 +399,9 @@ func (s *FileStore) loadLocked() (dataset, error) {
 	}
 	if ds.Subscriptions == nil {
 		ds.Subscriptions = []Subscription{}
+	}
+	if ds.PlanConfigs == nil {
+		ds.PlanConfigs = []PlanConfig{}
 	}
 	return ds, nil
 }
@@ -274,4 +418,11 @@ func (s *FileStore) saveLocked(ds dataset) error {
 		return err
 	}
 	return os.Rename(tmp, s.path)
+}
+
+func normalizeSubjectID(userID, tenantID string) string {
+	if strings.TrimSpace(userID) != "" {
+		return strings.TrimSpace(userID)
+	}
+	return strings.TrimSpace(tenantID)
 }

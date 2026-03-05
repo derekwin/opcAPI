@@ -9,141 +9,216 @@ import (
 	"time"
 )
 
-func TestTopupAndBalance(t *testing.T) {
+func TestGetMembershipDefaultFree(t *testing.T) {
 	s := newTestService(t)
-
-	bal, ord, err := s.Topup(context.Background(), "ten_1", TopupRequest{
-		Channel:  "manual",
-		Amount:   100,
-		Currency: "CNY",
-	})
+	m, err := s.GetMembership(context.Background(), "usr_free")
 	if err != nil {
-		t.Fatalf("topup failed: %v", err)
+		t.Fatalf("get membership failed: %v", err)
 	}
-	if bal.Amount != 100 {
-		t.Fatalf("unexpected balance amount: %v", bal.Amount)
-	}
-	if ord.Type != "topup" {
-		t.Fatalf("unexpected order type: %s", ord.Type)
+	if m.PlanID != "free" || m.Status != "free" {
+		t.Fatalf("unexpected free membership: %+v", m)
 	}
 
-	bal2, err := s.GetBalance(context.Background(), "ten_1")
+	policy, err := s.ResolveUsagePolicy(context.Background(), "usr_free")
 	if err != nil {
-		t.Fatalf("get balance failed: %v", err)
+		t.Fatalf("resolve usage policy failed: %v", err)
 	}
-	if bal2.Amount != 100 {
-		t.Fatalf("unexpected balance amount: %v", bal2.Amount)
+	if policy.PlanID != "free" || policy.Unlimited {
+		t.Fatalf("unexpected free policy: %+v", policy)
+	}
+	if policy.FiveHourTokenLimit <= 0 || policy.MonthlyTokenLimit <= 0 {
+		t.Fatalf("free policy should have finite limits: %+v", policy)
 	}
 }
 
-func TestSubscribeAndListOrders(t *testing.T) {
+func TestSubscribeCreatesMembershipOrderFixedPrice(t *testing.T) {
 	s := newTestService(t)
 
-	sub, ord, err := s.Subscribe(context.Background(), "ten_2", SubscribeRequest{
-		PlanID:   "pro",
-		Channel:  "stripe",
-		Amount:   29.9,
-		Currency: "USD",
-		Months:   1,
+	sub, ord, err := s.Subscribe(context.Background(), "usr_sub", SubscribeRequest{
+		PlanID:  "starter",
+		Channel: "stripe",
+		Months:  1,
 	})
 	if err != nil {
 		t.Fatalf("subscribe failed: %v", err)
 	}
-	if sub.PlanID != "pro" {
-		t.Fatalf("unexpected plan id: %s", sub.PlanID)
+	if sub.PlanID != "starter" || sub.Status != "active" {
+		t.Fatalf("unexpected subscription: %+v", sub)
 	}
-	if ord.Type != "subscription" {
-		t.Fatalf("unexpected order type: %s", ord.Type)
+	if !sub.PeriodEnd.After(sub.PeriodStart) {
+		t.Fatalf("invalid subscription period: %+v", sub)
+	}
+	if ord.Type != "subscription" || ord.PlanID != "starter" {
+		t.Fatalf("unexpected order: %+v", ord)
+	}
+	if ord.Currency != "CNY" {
+		t.Fatalf("unexpected order currency: %s", ord.Currency)
+	}
+	if ord.Amount != 29 {
+		t.Fatalf("starter plan should use fixed price 29 CNY, got %v", ord.Amount)
 	}
 
-	orders, err := s.ListOrders(context.Background(), "ten_2", 10)
+	m, err := s.GetMembership(context.Background(), "usr_sub")
 	if err != nil {
-		t.Fatalf("list orders failed: %v", err)
+		t.Fatalf("get membership failed: %v", err)
 	}
-	if len(orders) != 1 {
-		t.Fatalf("expected 1 order, got %d", len(orders))
+	if m.PlanID != "starter" || m.Status != "active" {
+		t.Fatalf("unexpected membership after subscribe: %+v", m)
 	}
 }
 
-func TestInvalidRequests(t *testing.T) {
+func TestPlanConfigCanBeUpdatedByAdmin(t *testing.T) {
+	s := newTestService(t)
+	_, err := s.SetPlanConfigs(context.Background(), []PlanConfig{
+		{
+			PlanID:             "starter",
+			PriceCNY:           66,
+			RPMLimit:           222,
+			FiveHourTokenLimit: 123456,
+			MonthlyTokenLimit:  987654,
+			Unlimited:          false,
+		},
+	})
+	if err != nil {
+		t.Fatalf("set plan configs failed: %v", err)
+	}
+
+	p, err := s.ResolveUsagePolicy(context.Background(), "usr_free_plan")
+	if err != nil {
+		t.Fatalf("resolve usage policy failed: %v", err)
+	}
+	if p.PlanID != "free" {
+		t.Fatalf("free user plan should remain free, got %+v", p)
+	}
+
+	sub, ord, err := s.Subscribe(context.Background(), "usr_cfg", SubscribeRequest{
+		PlanID:  "starter",
+		Channel: "stripe",
+		Months:  1,
+	})
+	if err != nil {
+		t.Fatalf("subscribe failed: %v", err)
+	}
+	if sub.PlanID != "starter" {
+		t.Fatalf("unexpected plan: %+v", sub)
+	}
+	if ord.Amount != 66 {
+		t.Fatalf("starter price should follow admin config, got %v", ord.Amount)
+	}
+
+	mPolicy, err := s.ResolveUsagePolicy(context.Background(), "usr_cfg")
+	if err != nil {
+		t.Fatalf("resolve usage policy for subscribed user failed: %v", err)
+	}
+	if mPolicy.RPMLimit != 222 || mPolicy.FiveHourTokenLimit != 123456 || mPolicy.MonthlyTokenLimit != 987654 {
+		t.Fatalf("unexpected configured policy: %+v", mPolicy)
+	}
+}
+
+func TestSubscribeRejectsInvalidRequests(t *testing.T) {
 	s := newTestService(t)
 
-	if _, _, err := s.Topup(context.Background(), "ten_1", TopupRequest{Channel: "manual", Amount: 0, Currency: "CNY"}); err != ErrInvalidAmount {
-		t.Fatalf("expected ErrInvalidAmount, got %v", err)
+	if _, _, err := s.Subscribe(context.Background(), "", SubscribeRequest{PlanID: "starter", Channel: "stripe", Months: 1}); err != ErrInvalidUserID {
+		t.Fatalf("expected ErrInvalidUserID, got %v", err)
 	}
-	if _, _, err := s.Topup(context.Background(), "ten_1", TopupRequest{Channel: "unknown", Amount: 1, Currency: "CNY"}); err != ErrInvalidChannel {
-		t.Fatalf("expected ErrInvalidChannel, got %v", err)
-	}
-	if _, _, err := s.Subscribe(context.Background(), "ten_1", SubscribeRequest{PlanID: "", Channel: "stripe", Amount: 1, Currency: "USD", Months: 1}); err != ErrInvalidPlan {
+	if _, _, err := s.Subscribe(context.Background(), "usr_1", SubscribeRequest{PlanID: "", Channel: "stripe", Months: 1}); err != ErrInvalidPlan {
 		t.Fatalf("expected ErrInvalidPlan, got %v", err)
+	}
+	if _, _, err := s.Subscribe(context.Background(), "usr_1", SubscribeRequest{PlanID: "free", Channel: "stripe", Months: 1}); err != ErrInvalidPlan {
+		t.Fatalf("expected ErrInvalidPlan for free plan subscribe, got %v", err)
+	}
+	if _, _, err := s.Subscribe(context.Background(), "usr_1", SubscribeRequest{PlanID: "starter", Channel: "stripe", Months: 2}); err != ErrInvalidSubscription {
+		t.Fatalf("expected ErrInvalidSubscription for months!=1, got %v", err)
+	}
+}
+
+func TestSetMembershipAdmin(t *testing.T) {
+	s := newTestService(t)
+
+	end := time.Now().Add(72 * time.Hour)
+	sub, err := s.SetMembershipAdmin(context.Background(), "usr_admin_set", AdminSetMembershipRequest{
+		PlanID:    "pro",
+		PeriodEnd: end,
+	})
+	if err != nil {
+		t.Fatalf("set membership failed: %v", err)
+	}
+	if sub.PlanID != "pro" || sub.Status != "active" {
+		t.Fatalf("unexpected admin subscription: %+v", sub)
+	}
+
+	m, err := s.GetMembership(context.Background(), "usr_admin_set")
+	if err != nil {
+		t.Fatalf("get membership failed: %v", err)
+	}
+	if m.PlanID != "pro" || m.Status != "active" {
+		t.Fatalf("unexpected membership after admin set: %+v", m)
+	}
+
+	_, err = s.SetMembershipAdmin(context.Background(), "usr_admin_set", AdminSetMembershipRequest{PlanID: "pro"})
+	if err != ErrInvalidPeriodEnd {
+		t.Fatalf("expected ErrInvalidPeriodEnd, got %v", err)
+	}
+}
+
+func TestResolveUsagePolicyBusinessUnlimited(t *testing.T) {
+	s := newTestService(t)
+	_, err := s.SetMembershipAdmin(context.Background(), "usr_biz", AdminSetMembershipRequest{
+		PlanID:    "business",
+		PeriodEnd: time.Now().Add(24 * time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("set business membership failed: %v", err)
+	}
+
+	p, err := s.ResolveUsagePolicy(context.Background(), "usr_biz")
+	if err != nil {
+		t.Fatalf("resolve usage policy failed: %v", err)
+	}
+	if p.PlanID != "business" || !p.Unlimited {
+		t.Fatalf("unexpected business policy: %+v", p)
+	}
+	if p.FiveHourTokenLimit != 0 || p.MonthlyTokenLimit != 0 {
+		t.Fatalf("business should be unlimited, got %+v", p)
 	}
 }
 
 func TestListOrdersAdminFilterAndPagination(t *testing.T) {
 	s := newTestService(t)
 
-	if _, _, err := s.Topup(context.Background(), "ten_a", TopupRequest{Channel: "manual", Amount: 9, Currency: "CNY"}); err != nil {
-		t.Fatalf("topup failed: %v", err)
-	}
-	time.Sleep(2 * time.Millisecond)
-	if _, _, err := s.Subscribe(context.Background(), "ten_a", SubscribeRequest{PlanID: "pro", Channel: "stripe", Amount: 19, Currency: "USD", Months: 1}); err != nil {
+	if _, _, err := s.Subscribe(context.Background(), "usr_a", SubscribeRequest{PlanID: "starter", Channel: "stripe", Months: 1}); err != nil {
 		t.Fatalf("subscribe failed: %v", err)
 	}
 	time.Sleep(2 * time.Millisecond)
-	if _, _, err := s.Topup(context.Background(), "ten_b", TopupRequest{Channel: "manual", Amount: 6, Currency: "CNY"}); err != nil {
-		t.Fatalf("topup failed: %v", err)
+	if _, _, err := s.Subscribe(context.Background(), "usr_a", SubscribeRequest{PlanID: "pro", Channel: "stripe", Months: 1}); err != nil {
+		t.Fatalf("subscribe failed: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	if _, _, err := s.Subscribe(context.Background(), "usr_b", SubscribeRequest{PlanID: "starter", Channel: "yipay", Months: 1}); err != nil {
+		t.Fatalf("subscribe failed: %v", err)
 	}
 
 	page, err := s.ListOrdersAdmin(context.Background(), OrderQuery{
-		TenantID: "ten_a",
-		Type:     "topup",
-		Limit:    1,
-		Offset:   0,
+		UserID: "usr_a",
+		Type:   "subscription",
+		Limit:  1,
+		Offset: 0,
 	})
 	if err != nil {
 		t.Fatalf("list orders admin failed: %v", err)
 	}
-	if page.Total != 1 || len(page.Data) != 1 {
+	if page.Total != 2 || len(page.Data) != 1 {
 		t.Fatalf("unexpected page data: total=%d count=%d", page.Total, len(page.Data))
 	}
-	if page.Data[0].Type != "topup" || page.Data[0].TenantID != "ten_a" {
+	if page.Data[0].Type != "subscription" || page.Data[0].UserID != "usr_a" {
 		t.Fatalf("unexpected order: %+v", page.Data[0])
 	}
 }
 
-func TestChargeUsage(t *testing.T) {
+func TestTopupDisabled(t *testing.T) {
 	s := newTestService(t)
-
-	if _, _, err := s.Topup(context.Background(), "ten_charge", TopupRequest{
-		Channel:  "manual",
-		Amount:   1,
-		Currency: "CNY",
-	}); err != nil {
-		t.Fatalf("topup failed: %v", err)
-	}
-
-	before, err := s.GetBalance(context.Background(), "ten_charge")
-	if err != nil {
-		t.Fatalf("get balance failed: %v", err)
-	}
-
-	after, cost, err := s.ChargeUsage(context.Background(), "ten_charge", 100, 50)
-	if err != nil {
-		t.Fatalf("charge usage failed: %v", err)
-	}
-	if cost <= 0 {
-		t.Fatalf("expected positive cost, got %v", cost)
-	}
-	if after.Amount >= before.Amount {
-		t.Fatalf("expected balance decrease, before=%v after=%v", before.Amount, after.Amount)
-	}
-}
-
-func TestChargeUsageInsufficientBalance(t *testing.T) {
-	s := newTestService(t)
-
-	if _, _, err := s.ChargeUsage(context.Background(), "ten_no_funds", 10, 10); err != ErrInsufficientBalance {
-		t.Fatalf("expected ErrInsufficientBalance, got %v", err)
+	if _, _, err := s.Topup(context.Background(), "usr_topup", TopupRequest{Channel: "manual", Amount: 1, Currency: "CNY"}); err != ErrTopupDisabled {
+		t.Fatalf("expected ErrTopupDisabled, got %v", err)
 	}
 }
 

@@ -14,30 +14,28 @@ import (
 	"github.com/derekwin/opcAPI/internal/auth"
 	"github.com/derekwin/opcAPI/internal/billing"
 	"github.com/derekwin/opcAPI/internal/config"
-	"github.com/derekwin/opcAPI/internal/keymgmt"
 	"github.com/derekwin/opcAPI/internal/promptapi"
 	"github.com/derekwin/opcAPI/internal/provider"
 	"github.com/derekwin/opcAPI/internal/quota"
 	redisstore "github.com/derekwin/opcAPI/internal/store/redis"
 	httptransport "github.com/derekwin/opcAPI/internal/transport/http"
+	"github.com/derekwin/opcAPI/internal/upstream"
 	"github.com/derekwin/opcAPI/internal/user"
 )
 
 // API wires core dependencies and controls application lifecycle.
 type API struct {
-	cfg          config.Config
-	logger       *slog.Logger
-	server       *http.Server
-	policySyncer *keymgmt.PolicySyncer
-	initErr      error
+	cfg     config.Config
+	logger  *slog.Logger
+	server  *http.Server
+	initErr error
 }
 
 func New(cfg config.Config, logger *slog.Logger) *API {
-	gateway := provider.NewGateway(cfg, logger)
 	authManager := auth.NewManager(cfg, logger)
 
 	userStore, userStoreErr := user.NewFileStore(cfg.UserStorePath)
-	userService := user.NewService(userStore, user.NewSessionManager(cfg.SessionSecret, cfg.SessionTTL), cfg.PhoneTestCode, logger)
+	userService := user.NewService(userStore, user.NewSessionManager(cfg.SessionSecret, cfg.SessionTTL), logger)
 	billingStore, billingStoreErr := billing.NewFileStore(cfg.BillingStorePath)
 	billingService := billing.NewService(billingStore, logger)
 	promptStore, promptStoreErr := promptapi.NewFileStore(cfg.PromptAPIStorePath)
@@ -48,6 +46,8 @@ func New(cfg config.Config, logger *slog.Logger) *API {
 	}
 	auditStore, auditStoreErr := audit.NewFileStore(auditPath)
 	auditService := audit.NewService(auditStore, logger)
+	upstreamStore, upstreamStoreErr := upstream.NewFileStore(cfg.UpstreamStorePath)
+	upstreamService := upstream.NewService(upstreamStore, logger)
 
 	var redisClient *redisstore.Client
 	var limiter *quota.Limiter
@@ -61,13 +61,13 @@ func New(cfg config.Config, logger *slog.Logger) *API {
 			ReadTimeout:  cfg.RedisReadTimeout,
 			WriteTimeout: cfg.RedisWriteTimeout,
 		})
-		limiter = quota.NewRedisLimiter(cfg.RequestRPMLimit, cfg.DailyTokenLimit, redisClient, cfg.RedisQuotaPrefix)
+		limiter = quota.NewRedisLimiter(cfg.RequestRPMLimit, 0, redisClient, cfg.RedisQuotaPrefix)
 	} else {
-		limiter = quota.NewLimiter(cfg.RequestRPMLimit, cfg.DailyTokenLimit)
+		limiter = quota.NewLimiter(cfg.RequestRPMLimit, 0)
 	}
 
-	policySyncer := keymgmt.NewPolicySyncer(cfg, logger, authManager, limiter, redisClient)
-	handler := httptransport.NewRouter(logger, gateway, authManager, cfg.RequireTenantBoundKey, limiter, policySyncer, userService, billingService, promptService, auditService)
+	gateway := provider.NewGatewayWithUpstream(cfg, logger, upstreamService)
+	handler := httptransport.NewRouter(logger, gateway, authManager, limiter, userService, billingService, promptService, upstreamService, auditService)
 
 	server := &http.Server{
 		Addr:         cfg.HTTPAddr,
@@ -77,11 +77,10 @@ func New(cfg config.Config, logger *slog.Logger) *API {
 	}
 
 	return &API{
-		cfg:          cfg,
-		logger:       logger,
-		server:       server,
-		policySyncer: policySyncer,
-		initErr:      firstErr(userStoreErr, billingStoreErr, promptStoreErr, auditStoreErr),
+		cfg:     cfg,
+		logger:  logger,
+		server:  server,
+		initErr: firstErr(userStoreErr, billingStoreErr, promptStoreErr, auditStoreErr, upstreamStoreErr),
 	}
 }
 
@@ -91,13 +90,6 @@ func (a *API) Run(ctx context.Context) error {
 	}
 	sigCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
-
-	if a.policySyncer != nil {
-		if err := a.policySyncer.Initialize(sigCtx); err != nil {
-			return err
-		}
-		go a.policySyncer.Start(sigCtx)
-	}
 
 	errCh := make(chan error, 1)
 
