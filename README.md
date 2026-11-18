@@ -5,6 +5,8 @@
 - OpenAI-compatible LLM gateway (`/v1/*`)
 - admin web console (`/admin`)
 
+The [GLM API key console](glm-key-console/README.md) is a standalone Go module for a self-hosted inference server. It includes a user invitation flow, per-user API keys, a streaming proxy and systemd units.
+
 ## Routing Convention
 
 - `/v1/*`: OpenAI-compatible / LLM related endpoints only

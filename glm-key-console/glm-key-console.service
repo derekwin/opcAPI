@@ -1,0 +1,21 @@
+[Unit]
+Description=GLM API key console
+After=network.target
+
+[Service]
+User=glmkeys
+Group=glmkeys
+StateDirectory=glm-key-console
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/glm-key-console
+ExecStart=/opt/glm-key-console/glm-key-console -db /var/lib/glm-key-console/keys.sqlite3 -listen 127.0.0.1:18080 -public-origin-file /etc/glm-key-console/origin
+Restart=on-failure
+RestartSec=2
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

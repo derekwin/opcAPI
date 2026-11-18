@@ -1,0 +1,25 @@
+[Unit]
+Description=GLM API key HTTPS gateway on A800
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=glmkeys
+Group=glmkeys
+StateDirectory=glm-key-console
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/glm-key-console
+EnvironmentFile=/etc/glm-key-console/gateway.env
+ExecStart=/opt/glm-key-console/glm-key-console -db /var/lib/glm-key-console/keys.sqlite3 -listen ${GLM_HTTPS_LISTEN} -tls-cert /etc/glm-key-console/tls/ip-cert.pem -tls-key /etc/glm-key-console/tls/ip-key.pem -public-origin-file /etc/glm-key-console/origin -external-only
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+Restart=on-failure
+RestartSec=2
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
