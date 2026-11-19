@@ -1,0 +1,14 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{{if eq .Path "/register"}}注册管理员{{else if eq .Path "/password"}}修改密码{{else}}管理员登录{{end}} · API Key 管理</title><link rel="stylesheet" href="/admin.css"></head>
+<body><header><div class="frame bar"><div class="brand"><span class="mark" aria-hidden="true">⌁</span>模型网关</div></div></header>
+<main class="auth-card"><h1>{{if eq .Path "/register"}}注册管理员{{else if eq .Path "/password"}}修改密码{{else}}管理员登录{{end}}</h1>
+{{if eq .Path "/password"}}<p>修改后，所有设备都需要重新登录。</p>{{end}}
+{{if .Message}}<p role="status">{{.Message}}</p>{{end}}
+<form method="post" action="{{.Path}}">
+{{if eq .Path "/password"}}<label>账号<input name="username" autocomplete="username" value="{{.Username}}" readonly></label>
+<label>当前密码<input name="current" type="password" autocomplete="current-password" required></label>
+{{else}}<label>用户名<input name="username" value="{{.Username}}" maxlength="64" autocomplete="username" required></label>{{end}}
+{{if eq .Path "/login"}}<label>密码<input name="password" type="password" autocomplete="current-password" required></label><button class="primary">登录</button>
+{{else}}<label>新密码<input name="password" type="password" autocomplete="new-password" required></label>
+<label>确认新密码<input name="confirm" type="password" autocomplete="new-password" required></label>
+<button class="primary">{{if eq .Path "/register"}}注册并登录{{else}}保存新密码{{end}}</button>{{end}}</form>
+{{if eq .Path "/password"}}<a href="/">返回 Key 管理</a>{{end}}</main></body></html>

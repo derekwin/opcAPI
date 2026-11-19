@@ -1,0 +1,23 @@
+[Unit]
+Description=API Key manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=glmkeys
+Group=glmkeys
+RuntimeDirectory=key-manager
+RuntimeDirectoryMode=0700
+StateDirectory=key-manager
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/key-manager
+ExecStart=/usr/local/bin/key-manager -api-http -listen 0.0.0.0:18180 -admin-http -admin-listen 0.0.0.0:18181
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+UMask=0077
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

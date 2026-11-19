@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>API Key 管理</title>
+<link rel="stylesheet" href="/admin.css"><script defer src="/admin.js"></script></head>
+<body><header><div class="frame bar"><div class="brand"><span class="mark" aria-hidden="true">⌁</span>模型网关</div><nav class="account-nav" aria-label="管理员账号"><a href="/password">修改密码</a><form method="post" action="/logout"><button>退出登录</button></form></nav></div></header>
+<main class="frame"><div class="heading"><h1>API Key 管理</h1><button type="button" class="primary" data-open="create"><b aria-hidden="true">＋</b> 创建 Key</button></div>
+<section class="guide-banner" aria-label="模型接入公告"><details id="guide-details"><summary>模型接入公告</summary><div id="guide-content">{{template "instructions"}}</div></details><button id="copy-guide" type="button">复制公告</button></section>
+{{with .Created}}<section class="issued"><div><strong>已创建「{{.Label}}」</strong><code>{{.Secret}}</code></div><button data-copy="{{.Secret}}">复制 Key</button></section>{{end}}
+{{if .Notice}}<p class="notice" role="status">{{.Notice}}</p>{{end}}
+<section class="panel" aria-label="密钥列表"><div class="toolbar"><h2>密钥列表 <span class="num">{{len .Records}}</span></h2>
+{{if .Records}}<div class="tools"><label class="search"><span aria-hidden="true">⌕</span><input id="search" type="search" aria-label="搜索名称或 Key" placeholder="搜索名称或 Key"></label>
+<select id="status" aria-label="状态筛选"><option value="">全部状态</option><option>可用</option><option>已停用</option><option>已到期</option><option>额度已用完</option></select></div>{{end}}</div>
+{{if .Records}}<div class="grid columns" aria-hidden="true"><span>名称 / 密钥</span><span>状态</span><span>剩余额度</span><span>到期日</span><span>操作</span></div>
+{{range .Records}}<article class="grid record" data-id="{{.ID}}" data-label="{{.Label}}" data-secret="{{.Secret}}" data-status="{{.Status}}" data-rpm="{{.RPM}}" data-parallel="{{.Concurrent}}" data-unlimited="{{.Unlimited}}" data-limit="{{count .Limit}}" data-used="{{count .Used}}">
+<div class="name"><strong>{{.Label}}</strong><code>{{.Preview}}</code></div>
+<div class="state"><span class="badge" data-state="{{.Status}}">{{.Status}}</span></div>
+<div class="balance">{{if .Unlimited}}<span>不限额度</span>{{else}}<span>{{count .Remaining}} <small>Token</small></span><progress aria-label="剩余额度" value="{{.Remaining}}" max="{{.Limit}}"></progress>{{end}}</div>
+<time datetime="{{.Expires.Format "2006-01-02T15:04:05Z07:00"}}">{{.ExpiryDate}}</time>
+<div class="actions">{{if .Secret}}<button class="light" data-copy="{{.Secret}}" aria-label="复制 {{.Label}} 的 Key">复制</button>{{end}}<button data-manage aria-label="管理 {{.Label}}">管理</button></div></article>{{end}}
+<div id="no-match" class="empty" hidden><h3>没有匹配的 Key</h3><button id="reset">清除筛选</button></div>
+{{else}}<div class="empty"><div class="key-icon" aria-hidden="true">⚿</div><h3>还没有 API Key</h3><p>创建第一把 Key，设置额度后即可交付使用。</p><button data-open="create">创建第一把 Key</button></div>{{end}}</section></main>
+
+<dialog id="create" aria-labelledby="create-title"><div class="dialog-head"><h2 id="create-title">创建 API Key</h2><button class="close" data-close aria-label="关闭">×</button></div>
+<form method="post"><input type="hidden" name="action" value="create">
+<label>名称<input required autofocus name="label" maxlength="100" placeholder="客户或项目名称"></label>
+<div class="fields"><label>累计额度（Token）<input required type="number" min="1" max="1000000000" name="limit" value="1000000"></label><label>有效期（天）<input required type="number" min="1" max="3650" name="days" value="7"></label></div>
+<label class="quota-check"><input type="checkbox" name="unlimited" id="create-unlimited" value="1">不限累计额度</label>
+<details><summary>请求限制</summary><div class="fields"><label>每分钟请求数<input required type="number" min="1" max="1000000000" name="rpm" value="30"></label><label>最大并发数<input required type="number" min="1" max="1000000000" name="parallel" value="2"></label></div></details>
+<footer><button type="button" data-close>取消</button><button class="primary">创建 Key</button></footer></form></dialog>
+
+<dialog id="manage" aria-labelledby="manage-title"><div class="dialog-head"><h2 id="manage-title"></h2><button class="close" data-close aria-label="关闭">×</button></div>
+<div id="credential"><div class="section-label">完整 Key</div><div class="secret-box"><code id="full"></code><button id="copy-full">复制</button></div></div>
+<dl><dt>已用及预占 / 总额度</dt><dd id="usage"></dd><dt>每分钟请求 / 最大并发</dt><dd id="rate"></dd></dl>
+<form id="add-form" method="post"><input type="hidden" name="action" value="add"><input type="hidden" name="id"><label><span id="quota-label">追加额度（Token）</span><span class="inline"><input type="number" required name="extra" min="1" max="2147483647" placeholder="输入数量"><button id="quota-submit">追加额度</button></span></label></form>
+<form id="unlimited-form" method="post"><input type="hidden" name="action" value="unlimited"><input type="hidden" name="id"><button>设为不限累计额度</button></form>
+<footer class="maintenance"><button id="revoke" data-confirm="revoke">停用 Key</button><button class="danger-text" data-confirm="delete">删除 Key</button></footer></dialog>
+
+<dialog id="confirm" aria-labelledby="confirm-title"><h2 id="confirm-title"></h2><p id="consequence"></p>
+<form method="post"><input type="hidden" name="id"><input type="hidden" name="action"><footer><button type="button" id="back" autofocus>取消</button><button id="confirm-action" class="danger"></button></footer></form></dialog>
+<div id="toast" role="status" hidden></div></body></html>
